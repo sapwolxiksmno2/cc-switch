@@ -28,10 +28,17 @@ interface DatabaseUpgradeProps {
 
 // checking: 启动时检查是否有可用更新
 // upgradable: 有可用更新，升级应用即可解决
+// portable: 便携版只能手动下载新的 Portable ZIP
 // incompatible: 已是最新版本但数据库仍过新（可能来自第三方客户端），升级无法解决
 // updating: 正在下载/安装更新
 // error: 升级过程出错
-type Phase = "checking" | "upgradable" | "incompatible" | "updating" | "error";
+type Phase =
+  | "checking"
+  | "portable"
+  | "upgradable"
+  | "incompatible"
+  | "updating"
+  | "error";
 
 interface DownloadProgress {
   downloaded: number;
@@ -62,6 +69,13 @@ export function DatabaseUpgrade({ payload }: DatabaseUpgradeProps) {
     let cancelled = false;
     (async () => {
       try {
+        const portable = await invoke<boolean>("is_portable_mode");
+        if (cancelled) return;
+        if (portable) {
+          setPhase("portable");
+          return;
+        }
+
         const version = await invoke<string | null>(
           "check_app_update_available",
         );
@@ -192,6 +206,20 @@ export function DatabaseUpgrade({ payload }: DatabaseUpgradeProps) {
           </p>
         )}
 
+        {phase === "portable" && (
+          <div className="space-y-2 rounded-lg border border-amber-300/60 bg-amber-50 p-3 text-sm text-amber-700 dark:border-amber-500/40 dark:bg-amber-950/40 dark:text-amber-300">
+            <p className="font-medium">
+              {t("dbUpgrade.portableTitle", "便携版需要手动更新")}
+            </p>
+            <p className="leading-relaxed">
+              {t(
+                "dbUpgrade.portableDescription",
+                "请从发布页下载新的 Windows Portable 压缩包。当前程序不会启动安装器，也不会在系统盘写入更新文件。",
+              )}
+            </p>
+          </div>
+        )}
+
         {phase === "incompatible" && (
           <div className="space-y-2 rounded-lg border border-red-300/60 bg-red-50 p-3 text-sm text-red-700 dark:border-red-500/40 dark:bg-red-950/40 dark:text-red-300">
             <p className="font-medium">
@@ -263,7 +291,9 @@ export function DatabaseUpgrade({ payload }: DatabaseUpgradeProps) {
             </Button>
           )}
 
-          {(phase === "incompatible" || phase === "error") && (
+          {(phase === "portable" ||
+            phase === "incompatible" ||
+            phase === "error") && (
             <Button
               variant="outline"
               className="gap-2"

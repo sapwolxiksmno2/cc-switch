@@ -8,6 +8,7 @@ import React, {
 } from "react";
 import type { UpdateInfo } from "../lib/updater";
 import { checkForUpdate } from "../lib/updater";
+import { settingsApi } from "../lib/api/settings";
 
 interface UpdateContextValue {
   // 更新状态
@@ -65,6 +66,13 @@ export function UpdateProvider({ children }: { children: React.ReactNode }) {
     setError(null);
 
     try {
+      if (await settingsApi.isPortable()) {
+        setHasUpdate(false);
+        setUpdateInfo(null);
+        setIsDismissed(false);
+        return false;
+      }
+
       const result = await checkForUpdate({ timeout: 30000 });
 
       if (result.status === "available") {
@@ -118,8 +126,12 @@ export function UpdateProvider({ children }: { children: React.ReactNode }) {
   // 应用启动时自动检查更新
   useEffect(() => {
     // 延迟1秒后检查，避免影响启动体验
-    const timer = setTimeout(() => {
-      checkUpdate().catch(console.error);
+    const timer = setTimeout(async () => {
+      try {
+        await checkUpdate();
+      } catch (error) {
+        console.error(error);
+      }
     }, 1000);
 
     return () => clearTimeout(timer);
