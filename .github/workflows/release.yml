@@ -466,7 +466,7 @@ jobs:
             Write-Warning 'No Windows MSI installer found'
           }
 
-          # 绿色版（portable）：仅可执行文件打 zip（不参与 Updater）
+          # 绿色版（portable）：可执行文件 + data/ 标记打 zip（不参与 Updater）
           $exeCandidates = if ($isArm64) {
             @('src-tauri/target/aarch64-pc-windows-msvc/release/cc-switch.exe')
           } else {
@@ -479,8 +479,10 @@ jobs:
           if ($null -ne $exePath) {
             $portableDir = 'release-assets/CC-Switch-Portable'
             New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+            $portableDataDir = Join-Path $portableDir 'data'
+            New-Item -ItemType Directory -Force -Path $portableDataDir | Out-Null
             Copy-Item $exePath $portableDir
-            $portableIniPath = Join-Path $portableDir 'portable.ini'
+            $portableIniPath = Join-Path $portableDataDir 'portable.ini'
             $portableContent = if ($isArm64) {
               @(
                 '# CC Switch portable ARM64 build marker',
@@ -496,6 +498,29 @@ jobs:
             $portableContent | Set-Content -Path $portableIniPath -Encoding UTF8
             $portableZip = "release-assets/CC-Switch-$VERSION-Windows$assetSuffix-Portable.zip"
             Compress-Archive -Path "$portableDir/*" -DestinationPath $portableZip -Force
+
+            # Verify the archive layout before publishing it.  The executable
+            # remains at the archive root, while all Portable-owned state is
+            # selected by data/portable.ini and therefore starts below data/.
+            $verifyDir = 'release-assets/portable-layout-check'
+            if (Test-Path -LiteralPath $verifyDir) {
+              Remove-Item -Recurse -Force -LiteralPath $verifyDir
+            }
+            Expand-Archive -LiteralPath $portableZip -DestinationPath $verifyDir -Force
+            $rootFiles = @(Get-ChildItem -LiteralPath $verifyDir -File)
+            $rootDirectories = @(Get-ChildItem -LiteralPath $verifyDir -Directory)
+            if ($rootFiles.Count -ne 1 -or $rootFiles[0].Name -ne 'cc-switch.exe') {
+              throw 'Portable archive root must contain only cc-switch.exe'
+            }
+            if ($rootDirectories.Count -ne 1 -or $rootDirectories[0].Name -ne 'data') {
+              throw 'Portable archive root must contain only the data directory'
+            }
+            $portableMarker = Join-Path $verifyDir 'data/portable.ini'
+            if (-not (Test-Path -LiteralPath $portableMarker -PathType Leaf)) {
+              throw 'Portable archive is missing data/portable.ini'
+            }
+            Remove-Item -Recurse -Force -LiteralPath $verifyDir
+            Write-Host 'Portable archive layout verified'
             Remove-Item -Recurse -Force $portableDir
             Write-Host "Windows portable zip created: CC-Switch-$VERSION-Windows$assetSuffix-Portable.zip"
           } elseif ($isArm64) {

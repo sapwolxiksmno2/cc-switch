@@ -1,0 +1,201 @@
+name: Windows Portable
+
+on:
+  workflow_dispatch:
+  # Every browser upload starts a build, including the first commit that adds
+  # this workflow. Run workflow remains available for rebuilds without a commit.
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-portable-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-portable:
+    name: Build Windows x64 Portable
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Windows x64 target
+        shell: pwsh
+        run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Setup pnpm
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+          node --version
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build only the executable. A fork does not need the upstream updater,
+      # Apple, installer-signing, or R2 credentials.
+      - name: Build unsigned Portable executable
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle
+
+      - name: Prepare and verify Portable artifact
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $package = Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json
+          $version = [string]$package.version
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw 'package.json does not contain a version'
+          }
+
+          $assetName = "CC-Switch-v$version-Windows-Portable"
+          $stagingDir = Join-Path $env:GITHUB_WORKSPACE 'portable-artifact'
+          $dataDir = Join-Path $stagingDir 'data'
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+
+          $exePath = 'src-tauri/target/x86_64-pc-windows-msvc/release/cc-switch.exe'
+          if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+            throw "x86_64-pc-windows-msvc cc-switch.exe was not produced: $exePath"
+          }
+
+          Copy-Item -LiteralPath $exePath -Destination (Join-Path $stagingDir 'cc-switch.exe')
+          @(
+            '# CC Switch fork portable x64 build marker',
+            'portable=true',
+            'arch=x86_64'
+          ) | Set-Content -LiteralPath (Join-Path $dataDir 'portable.ini') -Encoding utf8
+
+          $rootFiles = @(Get-ChildItem -LiteralPath $stagingDir -File)
+          $rootDirectories = @(Get-ChildItem -LiteralPath $stagingDir -Directory)
+          if ($rootFiles.Count -ne 1 -or $rootFiles[0].Name -ne 'cc-switch.exe') {
+            throw 'Portable artifact root must contain only cc-switch.exe and data/'
+          }
+          if ($rootDirectories.Count -ne 1 -or $rootDirectories[0].Name -ne 'data') {
+            throw 'Portable artifact root must contain only cc-switch.exe and data/'
+          }
+          $dataFiles = @(Get-ChildItem -LiteralPath $dataDir -File -Recurse)
+          $dataDirectories = @(Get-ChildItem -LiteralPath $dataDir -Directory -Recurse)
+          if ($dataDirectories.Count -ne 0) {
+            throw 'Portable artifact data/ must not contain subdirectories'
+          }
+          if ($dataFiles.Count -ne 1 -or $dataFiles[0].Name -ne 'portable.ini') {
+            throw 'Portable artifact data/ must contain only portable.ini'
+          }
+
+          $exeSha256 = (Get-FileHash -LiteralPath (Join-Path $stagingDir 'cc-switch.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+          "asset_name=$assetName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "### $assetName" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "Executable SHA-256: ``$exeSha256``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host "Portable artifact verified: $stagingDir"
+
+      - name: Smoke test Portable write boundary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $stagingDir = Join-Path $env:GITHUB_WORKSPACE 'portable-artifact'
+          $smokeDir = Join-Path $env:RUNNER_TEMP 'portable-smoke'
+          $smokeHome = Join-Path $env:RUNNER_TEMP 'portable-smoke-home'
+          $actualProfile = $env:USERPROFILE
+          $appLocalData = Join-Path $env:LOCALAPPDATA 'com.ccswitch.desktop'
+          if (Test-Path -LiteralPath $appLocalData) {
+            throw "Runner is not clean before Portable smoke test: $appLocalData"
+          }
+          $forbiddenActualProfilePaths = @(
+            (Join-Path $actualProfile '.claude'),
+            (Join-Path $actualProfile '.claude.json'),
+            (Join-Path $actualProfile '.cc-switch'),
+            (Join-Path $actualProfile '.agents')
+          )
+          $preExisting = @(
+            $forbiddenActualProfilePaths | Where-Object { Test-Path -LiteralPath $_ }
+          )
+          if ($preExisting.Count -ne 0) {
+            throw "Runner profile was not clean before Portable smoke test: $($preExisting -join ', ')"
+          }
+
+          New-Item -ItemType Directory -Force -Path $smokeDir, $smokeHome | Out-Null
+          Copy-Item -Path "$stagingDir/*" -Destination $smokeDir -Recurse -Force
+          $env:CC_SWITCH_TEST_HOME = $smokeHome
+          $process = Start-Process `
+            -FilePath (Join-Path $smokeDir 'cc-switch.exe') `
+            -WorkingDirectory $smokeDir `
+            -WindowStyle Hidden `
+            -PassThru
+
+          $ready = $false
+          $webviewDir = Join-Path $smokeDir 'data/webview'
+          try {
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              if ($process.HasExited) {
+                throw "Portable smoke process exited early with code $($process.ExitCode)"
+              }
+              $databaseReady = Test-Path `
+                -LiteralPath (Join-Path $smokeDir 'data/cc-switch.db') `
+                -PathType Leaf
+              $webviewReady = @(
+                Get-ChildItem -LiteralPath $webviewDir -Force -Recurse -ErrorAction SilentlyContinue
+              ).Count -gt 0
+              if ($databaseReady -and $webviewReady) {
+                $ready = $true
+                break
+              }
+              Start-Sleep -Milliseconds 500
+              $process.Refresh()
+            }
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+              $process.WaitForExit()
+            }
+          }
+          Start-Sleep -Seconds 1
+          if (-not $ready) {
+            throw 'Portable smoke test did not initialize its database and WebView under data/ in 30 seconds'
+          }
+
+          if (Test-Path -LiteralPath $appLocalData) {
+            throw "Portable smoke test wrote to LocalAppData: $appLocalData"
+          }
+          $forbiddenHomePaths = @(
+            (Join-Path $smokeHome '.claude'),
+            (Join-Path $smokeHome '.claude.json'),
+            (Join-Path $smokeHome '.cc-switch'),
+            (Join-Path $smokeHome '.agents')
+          ) + $forbiddenActualProfilePaths
+          $unexpected = @($forbiddenHomePaths | Where-Object { Test-Path -LiteralPath $_ })
+          if ($unexpected.Count -ne 0) {
+            throw "Portable smoke test wrote outside data/: $($unexpected -join ', ')"
+          }
+          Write-Host 'Portable smoke test kept application-owned writes under data/'
+
+      # upload-artifact creates the one downloadable ZIP. Its root is the least
+      # common ancestor (portable-artifact), so one extraction yields the exe
+      # and data/ directly; there is no nested distributable ZIP.
+      - name: Upload Portable artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.asset_name }}
+          # Their least common ancestor is portable-artifact, which is stripped
+          # from the downloaded ZIP while preserving data/portable.ini.
+          path: |
+            portable-artifact/cc-switch.exe
+            portable-artifact/data/portable.ini
+          if-no-files-found: error
+          retention-days: 14
