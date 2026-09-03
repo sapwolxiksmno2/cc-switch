@@ -153,11 +153,7 @@ impl PortableWindowState {
             height: height?,
             maximized: maximized?,
         };
-        if state.width < 320
-            || state.height < 240
-            || state.width > 32_768
-            || state.height > 32_768
-        {
+        if state.width < 320 || state.height < 240 || state.width > 32_768 || state.height > 32_768 {
             return None;
         }
         Some(state)
