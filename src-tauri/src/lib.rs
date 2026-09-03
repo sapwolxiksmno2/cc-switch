@@ -26,6 +26,7 @@ mod openclaw_config;
 mod opencode_config;
 mod panic_hook;
 mod pi_config;
+mod portable;
 mod prompt;
 mod prompt_files;
 mod provider;
@@ -96,6 +97,32 @@ fn set_windows_app_user_model_id(app: &tauri::AppHandle) {
     } else {
         log::debug!("Windows AppUserModelID 已设置为 {app_id}");
     }
+}
+
+#[cfg(target_os = "windows")]
+fn create_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    if app.get_webview_window("main").is_some() {
+        return Ok(());
+    }
+
+    let window_config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .expect("main window configuration must exist");
+    let builder = tauri::WebviewWindowBuilder::from_config(app, window_config)?;
+    let builder = if let Some(paths) = portable::paths() {
+        // Tauri otherwise resolves its default WebView2 directory through
+        // LocalAppData, which creates com.ccswitch.desktop before WebView2
+        // observes WEBVIEW2_USER_DATA_FOLDER.
+        builder.data_directory(paths.webview_dir())
+    } else {
+        builder
+    };
+    builder.build()?;
+    Ok(())
 }
 
 pub(crate) struct RedactedUrl<'a> {
@@ -341,9 +368,17 @@ fn macos_tray_icon() -> Option<Image<'static>> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Portable path selection must happen before the panic hook, Tauri plugins
+    // or WebView2 can observe their default profile paths.
+    let portable_paths = portable::prepare_runtime();
+    if let Some(paths) = &portable_paths {
+        panic_hook::init_app_config_dir(paths.data_dir.clone());
+    }
+
     // 设置 panic hook，在应用崩溃时记录日志到 <app_config_dir>/crash.log（默认 ~/.cc-switch/crash.log）
     panic_hook::setup_panic_hook();
 
+    let portable_mode = portable_paths.is_some();
     let mut builder = tauri::Builder::default();
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -403,11 +438,20 @@ pub fn run() {
         });
     }
 
-    let builder = builder
+    let mut builder = builder
         // 注册 deep-link 插件（处理 macOS AppleEvent 和其他平台的深链接）
         .plugin(tauri_plugin_deep_link::init())
         // 拦截窗口关闭：根据设置决定是否最小化到托盘
         .on_window_event(|window, event| {
+            if window.label() == "main"
+                && matches!(
+                    event,
+                    tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+                )
+            {
+                capture_portable_normal_window_state(window.app_handle());
+            }
+
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 // 数据库版本过新的恢复模式下没有托盘可唤回，关闭即退出，避免应用隐身后台
                 let in_db_recovery = crate::init_status::get_init_error()
@@ -441,12 +485,20 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_store::Builder::new().build())
-        .plugin(
+        .plugin(tauri_plugin_store::Builder::new().build());
+
+    // The upstream window-state plugin always creates app_config_dir before
+    // saving. Keep it unchanged for installed builds; Portable uses the small
+    // data/window-state.ini adapter below so it never touches AppData.
+    if !portable_mode {
+        builder = builder.plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(window_state_flags())
                 .build(),
-        )
+        );
+    }
+
+    let builder = builder
         .setup(|app| {
             let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -505,12 +557,16 @@ pub fn run() {
             // 注册 Updater 插件（桌面端）；放在 logger 之后，确保失败可诊断。
             #[cfg(desktop)]
             {
-                if let Err(e) = app
-                    .handle()
-                    .plugin(tauri_plugin_updater::Builder::new().build())
-                {
-                    // 若配置不完整（如缺少 pubkey），跳过 Updater 而不中断应用
-                    log::warn!("初始化 Updater 插件失败，已跳过：{e}");
+                // Portable uses manual download updates. Avoid initializing an
+                // updater which may allocate staging files in a profile path.
+                if !crate::portable::is_portable_mode() {
+                    if let Err(e) = app
+                        .handle()
+                        .plugin(tauri_plugin_updater::Builder::new().build())
+                    {
+                        // 若配置不完整（如缺少 pubkey），跳过 Updater 而不中断应用
+                        log::warn!("初始化 Updater 插件失败，已跳过：{e}");
+                    }
                 }
             }
 
@@ -579,6 +635,12 @@ pub fn run() {
                         supported_version: Some(crate::database::SCHEMA_VERSION),
                     });
                     // 主窗口默认 visible:false，恢复界面必须强制显示
+                    #[cfg(target_os = "windows")]
+                    {
+                        create_main_window(app.handle())?;
+                        restore_portable_window_state(app.handle());
+                        capture_portable_normal_window_state(app.handle());
+                    }
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.set_focus();
@@ -1316,6 +1378,17 @@ pub fn run() {
                 });
             });
 
+            // The Windows config uses create:false so Portable can set an
+            // absolute WebView2 data directory before the environment is
+            // constructed. Build only after backend state is ready, avoiding
+            // frontend commands racing AppState initialization.
+            #[cfg(target_os = "windows")]
+            {
+                create_main_window(app.handle())?;
+                restore_portable_window_state(app.handle());
+                capture_portable_normal_window_state(app.handle());
+            }
+
             // Linux: 禁用 WebKitGTK 硬件加速，防止 EGL 初始化失败导致白屏
             #[cfg(target_os = "linux")]
             {
@@ -1746,6 +1819,16 @@ pub fn run() {
                 //   - 100ms 落盘等待：重启前的 DB 写入均为命令驱动、此刻已完成，
                 //     与所有 Tauri 应用默认重启路径的行为一致，无需额外等待
                 ExitRequestAction::DeferToTauriRestart => {
+                    // Portable does not load the upstream window-state plugin,
+                    // so its Exit hook cannot persist data/window-state.ini.
+                    // This callback is already on the event-loop thread, making
+                    // the synchronous geometry query safe from the deadlock
+                    // described above.
+                    let portable_save = portable::is_portable_mode()
+                        .then(|| save_portable_window_state(app_handle));
+                    if let Some(Err(error)) = portable_save {
+                        log::warn!("重启前保存 Portable 窗口状态失败: {error}");
+                    }
                     log::info!("收到重启请求 (code={code:?})，交由 Tauri 默认重启流程 re-exec");
                     return;
                 }
@@ -2242,9 +2325,99 @@ fn window_state_flags() -> StateFlags {
     StateFlags::POSITION | StateFlags::SIZE | StateFlags::MAXIMIZED
 }
 
+fn capture_portable_normal_window_state(app_handle: &tauri::AppHandle) {
+    if !portable::is_portable_mode() {
+        return;
+    }
+    let Some(window) = app_handle.get_webview_window("main") else {
+        return;
+    };
+    if window.is_maximized().unwrap_or_default() {
+        return;
+    }
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+        return;
+    };
+    portable::remember_normal_window_state(portable::PortableWindowState {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+        maximized: false,
+    });
+}
+
+pub(crate) fn restore_portable_window_state(app_handle: &tauri::AppHandle) {
+    let Some(paths) = portable::paths() else {
+        return;
+    };
+    let state_path = paths.window_state_path();
+    let state_text = match std::fs::read_to_string(&state_path) {
+        Ok(state) => state,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            log::warn!("读取 Portable 窗口状态失败: {error}");
+            return;
+        }
+    };
+    let Some(state) = portable::PortableWindowState::decode(&state_text) else {
+        log::warn!("Portable 窗口状态无效，使用默认窗口布局");
+        return;
+    };
+    let Some(window) = app_handle.get_webview_window("main") else {
+        return;
+    };
+
+    portable::remember_normal_window_state(state);
+
+    if let Err(error) = window.set_size(tauri::PhysicalSize::new(state.width, state.height)) {
+        log::warn!("恢复 Portable 窗口大小失败: {error}");
+    }
+    if let Err(error) = window.set_position(tauri::PhysicalPosition::new(state.x, state.y)) {
+        log::warn!("恢复 Portable 窗口位置失败: {error}");
+    }
+    if state.maximized {
+        window.maximize().unwrap_or_else(|error| {
+            log::warn!("恢复 Portable 窗口最大化状态失败: {error}");
+        });
+    }
+}
+
+fn save_portable_window_state(app_handle: &tauri::AppHandle) -> Result<(), String> {
+    let paths = portable::paths().ok_or_else(|| "Portable paths are unavailable".to_string())?;
+    let window = app_handle
+        .get_webview_window("main")
+        .ok_or_else(|| "main window is unavailable".to_string())?;
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    let maximized = window.is_maximized().map_err(|error| error.to_string())?;
+    let current = portable::PortableWindowState {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+        maximized,
+    };
+    if !maximized {
+        portable::remember_normal_window_state(current);
+    }
+    let state = portable::window_state_for_save(current);
+    let path = paths.window_state_path();
+    crate::config::atomic_write(&path, state.encode().as_bytes()).map_err(|error| error.to_string())
+}
+
 /// 当前应用的退出路径会拦截 `ExitRequested` 并最终直接 `std::process::exit(0)`，
 /// 这里需要在真正结束进程前手动落盘，避免 window-state 插件的默认退出钩子被绕过。
 pub fn save_window_state_before_exit(app_handle: &tauri::AppHandle) {
+    if portable::is_portable_mode() {
+        if let Err(err) = save_portable_window_state(app_handle) {
+            log::error!("退出前保存 Portable 窗口状态失败: {err}");
+        } else {
+            log::info!("已在退出前保存 Portable 窗口状态");
+        }
+        return;
+    }
+
     if let Err(err) = app_handle.save_window_state(window_state_flags()) {
         log::error!("退出前保存窗口状态失败: {err}");
     } else {

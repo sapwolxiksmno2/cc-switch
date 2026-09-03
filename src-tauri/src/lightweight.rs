@@ -63,10 +63,18 @@ pub fn exit_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
         .find(|w| w.label == "main")
         .ok_or("主窗口配置未找到")?;
 
-    WebviewWindowBuilder::from_config(app, window_config)
-        .map_err(|e| format!("加载主窗口配置失败: {e}"))?
+    let builder = WebviewWindowBuilder::from_config(app, window_config)
+        .map_err(|e| format!("加载主窗口配置失败: {e}"))?;
+    let builder = if let Some(paths) = crate::portable::paths() {
+        builder.data_directory(paths.webview_dir())
+    } else {
+        builder
+    };
+    builder
         .build()
         .map_err(|e| format!("创建主窗口失败: {e}"))?;
+
+    crate::restore_portable_window_state(app);
 
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();

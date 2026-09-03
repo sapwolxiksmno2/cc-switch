@@ -199,8 +199,15 @@ pub fn get_claude_settings_path() -> PathBuf {
     settings
 }
 
-/// 获取应用配置目录路径 (~/.cc-switch)
+/// 获取应用配置目录路径（安装版 `~/.cc-switch`；Portable 为 `exe/data`）
 pub fn get_app_config_dir() -> PathBuf {
+    // Portable builds always own their application data below the executable's
+    // data directory. Do this before consulting the Store override so a value
+    // saved by an installed build can never redirect Portable back to C:.
+    if let Some(paths) = crate::portable::paths() {
+        return paths.data_dir;
+    }
+
     if let Some(custom) = crate::app_store::get_app_config_dir_override() {
         return custom;
     }

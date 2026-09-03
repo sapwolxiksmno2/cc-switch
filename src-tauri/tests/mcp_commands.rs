@@ -911,6 +911,55 @@ fn enabling_claude_mcp_skips_when_claude_config_absent() {
 }
 
 #[test]
+fn installed_claude_directory_keeps_existing_mcp_sync_contract() {
+    use support::create_test_state;
+
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    // Installed builds retain the upstream contract: an existing Claude
+    // directory authorizes synchronization, including a backup-only shell.
+    fs::create_dir_all(home.join(".claude/backups")).expect("create stale Claude backups");
+    fs::create_dir_all(home.join(".claude/sessions")).expect("create stale Claude sessions");
+    assert!(!home.join(".claude.json").exists());
+
+    let state = create_test_state().expect("create test state");
+    McpService::upsert_server(
+        &state,
+        McpServer {
+            id: "claude-stale-shell-server".to_string(),
+            name: "Claude Stale Shell Server".to_string(),
+            server: json!({
+                "type": "stdio",
+                "command": "echo"
+            }),
+            apps: McpApps {
+                claude: false,
+                codex: false,
+                gemini: false,
+                grokbuild: false,
+                opencode: false,
+                hermes: false,
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        },
+    )
+    .expect("insert server without syncing");
+
+    McpService::toggle_app(&state, "claude-stale-shell-server", AppType::Claude, true)
+        .expect("toggle Claude should preserve installed synchronization");
+
+    assert!(
+        home.join(".claude.json").exists(),
+        "installed Claude directory should create ~/.claude.json"
+    );
+}
+
+#[test]
 fn explicit_default_claude_dir_keeps_default_split_mcp_path() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();

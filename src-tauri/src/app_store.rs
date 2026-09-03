@@ -11,6 +11,12 @@ const STORE_KEY_APP_CONFIG_DIR: &str = "app_config_dir_override";
 /// 缓存当前的 app_config_dir 覆盖路径，避免存储 AppHandle
 static APP_CONFIG_DIR_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
+fn app_paths_store_path() -> PathBuf {
+    crate::portable::paths()
+        .map(|paths| paths.app_store_path())
+        .unwrap_or_else(|| PathBuf::from("app_paths.json"))
+}
+
 fn override_cache() -> &'static RwLock<Option<PathBuf>> {
     APP_CONFIG_DIR_OVERRIDE.get_or_init(|| RwLock::new(None))
 }
@@ -27,7 +33,7 @@ pub fn get_app_config_dir_override() -> Option<PathBuf> {
 }
 
 fn read_override_from_store(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let store = match app.store_builder("app_paths.json").build() {
+    let store = match app.store_builder(app_paths_store_path()).build() {
         Ok(store) => store,
         Err(e) => {
             log::warn!("无法创建 Store: {e}");
@@ -76,7 +82,7 @@ pub fn set_app_config_dir_to_store(
     path: Option<&str>,
 ) -> Result<(), AppError> {
     let store = app
-        .store_builder("app_paths.json")
+        .store_builder(app_paths_store_path())
         .build()
         .map_err(|e| AppError::Message(format!("创建 Store 失败: {e}")))?;
 

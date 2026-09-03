@@ -196,6 +196,13 @@ pub async fn restart_app(app: AppHandle) -> Result<bool, String> {
 /// 这里把退出清理、安装和重启串在同一个后端流程中，避免依赖旧前端继续执行。
 #[tauri::command]
 pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> {
+    if crate::portable::is_portable_mode() {
+        return Err(
+            "Portable mode does not support in-app update installation; download the Portable ZIP from the releases page."
+                .to_string(),
+        );
+    }
+
     let updater = app
         .updater_builder()
         .build()
@@ -273,6 +280,10 @@ pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> 
 /// 升级无法解决，而不是让其反复尝试。
 #[tauri::command]
 pub async fn check_app_update_available(app: AppHandle) -> Result<Option<String>, String> {
+    if crate::portable::is_portable_mode() {
+        return Ok(None);
+    }
+
     let updater = app
         .updater_builder()
         .build()

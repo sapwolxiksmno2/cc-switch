@@ -2,16 +2,78 @@
 
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::app_config::{McpApps, McpConfig, McpServer, MultiAppConfig};
 use crate::error::AppError;
 
 use super::validation::{extract_server_spec, validate_server_spec};
 
+#[cfg(test)]
+mod tests {
+    use super::should_sync_claude_mcp_for_mode;
+    use std::fs;
+
+    #[test]
+    fn portable_gate_ignores_backup_only_shell() {
+        let root = tempfile::tempdir().expect("create Claude test root");
+        let config_dir = root.path().join(".claude");
+        fs::create_dir_all(config_dir.join("backups")).expect("create backups shell");
+        fs::create_dir_all(config_dir.join("sessions")).expect("create sessions shell");
+        assert!(!should_sync_claude_mcp_for_mode(
+            &config_dir,
+            &root.path().join(".claude.json"),
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn installed_gate_preserves_existing_directory_contract() {
+        let root = tempfile::tempdir().expect("create Claude test root");
+        let config_dir = root.path().join(".claude");
+        fs::create_dir_all(config_dir.join("backups")).expect("create backups shell");
+        assert!(should_sync_claude_mcp_for_mode(
+            &config_dir,
+            &root.path().join(".claude.json"),
+            false,
+            false,
+        ));
+    }
+}
+
+fn should_sync_claude_mcp_for_mode(
+    config_dir: &Path,
+    mcp_path: &Path,
+    explicit_existing_override: bool,
+    portable_mode: bool,
+) -> bool {
+    // Installed builds retain the existing directory/file contract.
+    if !portable_mode {
+        return config_dir.exists() || mcp_path.exists();
+    }
+
+    // Portable ignores empty/backups-only shells; an explicit override remains
+    // an intentional destination.
+    explicit_existing_override
+        || mcp_path.is_file()
+        || config_dir.join("settings.json").is_file()
+        || config_dir.join("claude.json").is_file()
+        || config_dir.join(".credentials.json").is_file()
+        || config_dir.join("projects").is_dir()
+}
+
 fn should_sync_claude_mcp() -> bool {
-    // Claude 未安装/未初始化时：通常 ~/.claude 目录与 ~/.claude.json 都不存在。
-    // 按用户偏好：此时跳过写入/删除，不创建任何文件或目录。
-    crate::config::get_claude_config_dir().exists() || crate::config::get_claude_mcp_path().exists()
+    let config_dir = crate::config::get_claude_config_dir();
+    let mcp_path = crate::config::get_claude_mcp_path();
+    let explicit_existing_override =
+        crate::settings::get_claude_override_dir().is_some_and(|dir| dir.is_dir());
+    should_sync_claude_mcp_for_mode(
+        &config_dir,
+        &mcp_path,
+        explicit_existing_override,
+        crate::portable::is_portable_mode(),
+    )
 }
 
 /// 返回已启用的 MCP 服务器（过滤 enabled==true）

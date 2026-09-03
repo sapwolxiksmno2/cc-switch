@@ -434,12 +434,22 @@ fn parse_branch_from_source_url(source_url: Option<&str>) -> Option<String> {
 
 /// 获取 `~/.agents/skills/` 目录（存在时返回）
 fn get_agents_skills_dir() -> Option<PathBuf> {
+    // Portable does not inspect the shared Agents Skills tree.
+    if crate::portable::is_portable_mode() {
+        return None;
+    }
+
     let dir = crate::config::get_home_dir().join(".agents").join("skills");
     dir.exists().then_some(dir)
 }
 
 /// 解析 `~/.agents/.skill-lock.json`，返回 skill_name -> 仓库信息
 fn parse_agents_lock() -> HashMap<String, LockRepoInfo> {
+    // Portable does not inspect the shared Agents lock.
+    if crate::portable::is_portable_mode() {
+        return HashMap::new();
+    }
+
     let path = crate::config::get_home_dir()
         .join(".agents")
         .join(".skill-lock.json");
@@ -547,11 +557,14 @@ impl SkillService {
 
     /// 获取 SSOT 目录（根据设置返回 ~/.cc-switch/skills/ 或 ~/.agents/skills/）
     pub fn get_ssot_dir() -> Result<PathBuf> {
-        let location = crate::settings::get_skill_storage_location();
-        let dir = match location {
-            SkillStorageLocation::CcSwitch => get_app_config_dir().join("skills"),
-            SkillStorageLocation::Unified => {
-                crate::config::get_home_dir().join(".agents").join("skills")
+        let dir = if let Some(paths) = crate::portable::paths() {
+            paths.data_dir.join("skills")
+        } else {
+            match crate::settings::get_skill_storage_location() {
+                SkillStorageLocation::CcSwitch => get_app_config_dir().join("skills"),
+                SkillStorageLocation::Unified => {
+                    crate::config::get_home_dir().join(".agents").join("skills")
+                }
             }
         };
         fs::create_dir_all(&dir)?;
@@ -1576,6 +1589,11 @@ impl SkillService {
     ) -> Result<MigrationResult> {
         let _state_guard = skill_state_write_guard();
         let current = crate::settings::get_skill_storage_location();
+        if crate::portable::is_portable_mode() && target == SkillStorageLocation::Unified {
+            return Err(anyhow!(
+                "Portable mode keeps the Skills storage under data/skills"
+            ));
+        }
         if current == target {
             return Ok(MigrationResult {
                 migrated_count: 0,
