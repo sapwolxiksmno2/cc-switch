@@ -1,0 +1,94 @@
+name: Windows Portable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-portable:
+    name: Windows x64 Portable
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 验证打包脚本
+        run: '& ./scripts/test-portable-package.ps1'
+
+      - name: 安装项目指定的 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+
+      - name: 检查 pnpm 固定版本声明
+        run: |
+          $package = Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json
+          if ($package.packageManager -cnotmatch '^pnpm@[0-9]+\.[0-9]+\.[0-9]+(?:\+sha[0-9]+\.[0-9a-f]+)?$') {
+            throw 'packageManager 必须固定 pnpm 版本。'
+          }
+
+      - name: 安装项目固定版本的 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: package.json
+          run_install: false
+
+      - name: 读取项目 Rust 工具链
+        id: rust-version
+        run: |
+          $toolchain = Get-Content -LiteralPath rust-toolchain.toml -Raw
+          $section = [regex]::Match($toolchain, '(?ms)^\[toolchain\][ \t]*\r?\n(?<body>.*?)(?=^\[|\z)')
+          $channel = [regex]::Match($section.Groups['body'].Value, '(?m)^channel\s*=\s*"(?<channel>[0-9]+\.[0-9]+(?:\.[0-9]+)?)"\s*(?:#.*)?$').Groups['channel'].Value
+          if ([string]::IsNullOrWhiteSpace($channel)) {
+            throw 'rust-toolchain.toml 必须指定固定 Rust 版本。'
+          }
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "channel=$channel`n")
+
+      - name: 安装项目指定的 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust-version.outputs.channel }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: 安装锁定的前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 检查 TypeScript
+        run: pnpm typecheck
+
+      - name: 构建前端以供 Rust 编译
+        run: pnpm build:renderer
+
+      - name: 运行 Rust 库测试
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: 构建 Windows x64 可执行文件
+        run: |
+          $overlay = Join-Path $env:RUNNER_TEMP ('portable-build-' + [guid]::NewGuid().ToString('N') + '.json')
+          try {
+            [IO.File]::WriteAllText($overlay, '{"bundle":{"createUpdaterArtifacts":false}}')
+            pnpm tauri build --no-bundle --target x86_64-pc-windows-msvc --config $overlay
+            if ($LASTEXITCODE -ne 0) { throw 'Portable 可执行文件构建失败。' }
+          }
+          finally {
+            if ([IO.File]::Exists($overlay)) { [IO.File]::Delete($overlay) }
+          }
+
+      - name: 打包并校验 Portable ZIP
+        id: package
+        run: |
+          $outputDirectory = Join-Path $env:RUNNER_TEMP ('portable-output-' + [guid]::NewGuid().ToString('N'))
+          $zipPath = & ./scripts/build-portable.ps1 -ExecutablePath ./src-tauri/target/x86_64-pc-windows-msvc/release/cc-switch.exe -OutputDirectory $outputDirectory
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "zip=$zipPath`n")
+
+      - name: 上传单个 Portable ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.package.outputs.zip }}
+          archive: false
+          if-no-files-found: error
