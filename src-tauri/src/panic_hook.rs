@@ -23,9 +23,16 @@ pub fn init_app_config_dir(dir: PathBuf) {
 
 /// 获取默认应用配置目录（不会 panic）
 fn default_app_config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cc-switch")
+    default_app_config_dir_for_data_dir(crate::portable::data_dir())
+}
+
+fn default_app_config_dir_for_data_dir(portable_data_dir: Option<PathBuf>) -> PathBuf {
+    // 不依赖设置缓存，避免早期 panic 处理中递归初始化；Portable 不回退用户目录。
+    portable_data_dir.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".cc-switch")
+    })
 }
 
 /// 获取应用配置目录（优先使用初始化时写入的值；不会 panic）
@@ -245,6 +252,28 @@ Stack Trace (Backtrace)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_early_crash_and_log_directory_stays_in_data() {
+        let fixture = tempfile::tempdir().expect("创建测试目录");
+        let data = fixture.path().join("便携版 with spaces").join("data");
+
+        let dir = default_app_config_dir_for_data_dir(Some(data.clone()));
+
+        assert!(dir.is_absolute());
+        assert_eq!(dir.join("crash.log"), data.join("crash.log"));
+        assert_eq!(dir.join("logs"), data.join("logs"));
+    }
+
+    #[test]
+    fn non_portable_early_crash_directory_keeps_existing_home_default() {
+        assert_eq!(
+            default_app_config_dir_for_data_dir(None),
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".cc-switch")
+        );
+    }
 
     #[test]
     fn test_crash_log_path() {

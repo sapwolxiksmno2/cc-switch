@@ -887,6 +887,8 @@
     "browsePlaceholderPi": "例如：/home/<你的用户名>/.pi/agent",
     "browseDirectory": "浏览目录",
     "resetDefault": "恢复默认目录（需保存后生效）",
+    "downloadUpdateOnGithub": "在 GitHub 下载 v{{version}}",
+    "openUpdateDownloadFailed": "打开更新下载页面失败，请稍后重试。",
     "checkForUpdates": "检查更新",
     "updateTo": "更新到 v{{version}}",
     "updating": "更新中...",

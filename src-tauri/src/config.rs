@@ -309,8 +309,12 @@ pub fn get_claude_settings_path() -> PathBuf {
     settings
 }
 
-/// 获取应用配置目录路径 (~/.cc-switch)
+/// 获取应用配置目录路径（Portable 使用程序目录下的 data，其他模式保持原有路径）。
 pub fn get_app_config_dir() -> PathBuf {
+    if let Some(portable_dir) = crate::portable::data_dir() {
+        return portable_dir;
+    }
+
     if let Some(custom) = crate::app_store::get_app_config_dir_override() {
         return custom;
     }

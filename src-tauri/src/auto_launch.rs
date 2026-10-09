@@ -42,6 +42,7 @@ fn get_auto_launch() -> Result<AutoLaunch, AppError> {
 
 /// 启用开机自启
 pub fn enable_auto_launch() -> Result<(), AppError> {
+    crate::portable::reject_system_write("启用开机自启").map_err(AppError::Message)?;
     let auto_launch = get_auto_launch()?;
     auto_launch
         .enable()
@@ -52,6 +53,10 @@ pub fn enable_auto_launch() -> Result<(), AppError> {
 
 /// 禁用开机自启
 pub fn disable_auto_launch() -> Result<(), AppError> {
+    // Portable 的关闭请求是无写入的幂等操作，不删除安装版的注册表项。
+    if crate::portable::is_portable() {
+        return Ok(());
+    }
     let auto_launch = get_auto_launch()?;
     auto_launch
         .disable()
@@ -62,6 +67,9 @@ pub fn disable_auto_launch() -> Result<(), AppError> {
 
 /// 检查是否已启用开机自启
 pub fn is_auto_launch_enabled() -> Result<bool, AppError> {
+    if crate::portable::is_portable() {
+        return Ok(false);
+    }
     let auto_launch = get_auto_launch()?;
     auto_launch
         .is_enabled()
@@ -72,6 +80,14 @@ pub fn is_auto_launch_enabled() -> Result<bool, AppError> {
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+
+    #[test]
+    fn portable_auto_launch_never_reads_or_writes_system_registration() {
+        let _portable = crate::portable::test_support::PortableTestRoot::new();
+        assert!(enable_auto_launch().unwrap_err().to_string().contains("Portable"));
+        assert!(disable_auto_launch().is_ok());
+        assert!(!is_auto_launch_enabled().unwrap());
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

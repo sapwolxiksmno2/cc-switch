@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use tempfile::{tempdir, TempDir};
+use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
 use zip::DateTime;
 
@@ -70,7 +70,7 @@ pub(crate) fn zip_skills_ssot(dest_path: &Path) -> Result<(), AppError> {
 }
 
 pub(crate) fn restore_skills_zip(raw: &[u8]) -> Result<(), AppError> {
-    let tmp = tempdir().map_err(|e| {
+    let tmp = crate::portable::create_temp_dir(None).map_err(|e| {
         io_context_localized(
             "webdav.sync.skills_extract_tmpdir_failed",
             "创建 skills 解压临时目录失败",
@@ -173,7 +173,7 @@ pub(crate) fn backup_current_skills() -> Result<SkillsBackup, AppError> {
             format!("Failed to resolve Skills SSOT directory: {e}"),
         )
     })?;
-    let tmp = tempdir().map_err(|e| {
+    let tmp = crate::portable::create_temp_dir(None).map_err(|e| {
         io_context_localized(
             "webdav.sync.skills_backup_tmpdir_failed",
             "创建 skills 备份临时目录失败",
@@ -377,6 +377,30 @@ mod tests {
     use std::io::Cursor;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn portable_skills_backup_and_restore_stage_only_in_data_tmp() {
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        let ssot = crate::services::skill::SkillService::get_ssot_dir().unwrap();
+        std::fs::write(ssot.join("placeholder.txt"), b"placeholder").unwrap();
+        let archive = portable.data_dir().join("fixture.zip");
+        super::zip_skills_ssot(&archive).unwrap();
+        let raw = std::fs::read(&archive).unwrap();
+        super::restore_skills_zip(&raw).unwrap();
+        assert_eq!(std::fs::read_dir(portable.temp_dir()).unwrap().count(), 0);
+        let backup = super::backup_current_skills().unwrap();
+        assert!(backup.backup_dir.starts_with(portable.temp_dir()));
+        assert!(backup._tmp.path().starts_with(portable.temp_dir()));
+        // tmp 变成文件后，恢复必须在创建暂存目录阶段失败，不能改用系统 temp。
+        drop(backup);
+        std::fs::remove_dir(portable.temp_dir()).unwrap();
+        std::fs::write(portable.temp_dir(), b"placeholder blocker").unwrap();
+        assert!(super::restore_skills_zip(&raw).is_err());
+        assert_eq!(
+            std::fs::read(ssot.join("placeholder.txt")).unwrap(),
+            b"placeholder"
+        );
+    }
 
     #[test]
     fn mark_visited_dir_tracks_canonical_duplicates() {

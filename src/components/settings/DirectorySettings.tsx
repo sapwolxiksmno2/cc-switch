@@ -195,6 +195,7 @@ export function DirectorySettings({
 }
 
 export interface DirectoryInputProps {
+  disabled?: boolean;
   label: string;
   description?: string;
   value?: string;
@@ -206,6 +207,7 @@ export interface DirectoryInputProps {
 }
 
 export function DirectoryInput({
+  disabled = false,
   label,
   description,
   value,
@@ -235,6 +237,7 @@ export function DirectoryInput({
       ) : null}
       <div className="flex items-center gap-2">
         <Input
+          disabled={disabled}
           value={displayValue}
           placeholder={placeholder}
           className="text-xs"
@@ -245,6 +248,7 @@ export function DirectoryInput({
             type="button"
             variant="outline"
             size="icon"
+            disabled={disabled}
             onClick={onBrowse}
             aria-label={t("settings.browseDirectory")}
           >
@@ -256,6 +260,7 @@ export function DirectoryInput({
             type="button"
             variant="outline"
             size="icon"
+            disabled={disabled}
             onClick={onReset}
             aria-label={t("settings.resetDefault")}
           >

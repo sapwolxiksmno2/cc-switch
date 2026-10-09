@@ -33,9 +33,10 @@ pub async fn export_config_to_file(
     #[allow(non_snake_case)] filePath: String,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
+    // export_sql 在生成 SQL 和写入前校验并解析实际目标路径。
+    let target_path = PathBuf::from(&filePath);
     let db = state.db.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let target_path = PathBuf::from(&filePath);
         db.export_sql(&target_path)?;
         Ok::<_, AppError>(json!({
             "success": true,
@@ -103,11 +104,14 @@ pub async fn save_file_dialog<R: tauri::Runtime>(
     #[allow(non_snake_case)] defaultName: String,
 ) -> Result<Option<String>, String> {
     let dialog = app.dialog();
-    let result = dialog
+    let mut builder = dialog
         .file()
         .add_filter("SQL", &["sql"])
-        .set_file_name(&defaultName)
-        .blocking_save_file();
+        .set_file_name(&defaultName);
+    if let Some(data) = crate::portable::data_dir() {
+        builder = builder.set_directory(data);
+    }
+    let result = builder.blocking_save_file();
 
     Ok(result.map(|p| p.to_string()))
 }

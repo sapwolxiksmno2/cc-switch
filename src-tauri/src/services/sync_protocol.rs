@@ -11,7 +11,6 @@ use std::sync::OnceLock;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::tempdir;
 
 use crate::error::AppError;
 use crate::services::skill::{skill_state_read_guard, skill_state_write_guard};
@@ -158,7 +157,7 @@ pub(crate) fn build_local_snapshot(
     let db_sql = sql_string.into_bytes();
 
     // Pack skills into deterministic ZIP
-    let tmp = tempdir().map_err(|e| {
+    let tmp = crate::portable::create_temp_dir(None).map_err(|e| {
         io_context_localized(
             "sync.snapshot_tmpdir_failed",
             "创建快照临时目录失败",
@@ -469,6 +468,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_snapshot_uses_data_tmp_and_cleans_up_staging() {
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        let db = crate::database::Database::memory().unwrap();
+        let skills = portable.data_dir().join("skills/placeholder");
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(skills.join("SKILL.md"), b"placeholder skill").unwrap();
+
+        let snapshot = build_local_snapshot(&db).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(snapshot.skills_zip)).unwrap();
+        assert!(archive.by_name("placeholder/SKILL.md").is_ok());
+        assert_eq!(fs::read_dir(portable.temp_dir()).unwrap().count(), 0);
+
+        // 阻挡 Portable 临时根后必须报错，不能回退到系统临时目录。
+        fs::remove_dir(portable.temp_dir()).unwrap();
+        fs::write(portable.temp_dir(), b"placeholder blocker").unwrap();
+        assert!(build_local_snapshot(&db).is_err());
+        assert!(portable.temp_dir().is_file());
+    }
+
 
     #[tokio::test]
     async fn webdav_and_s3_operations_share_one_sync_mutex() {

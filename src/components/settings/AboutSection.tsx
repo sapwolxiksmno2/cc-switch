@@ -131,14 +131,24 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
     }
   }, []);
 
+  const handleOpenDownloadPage = useCallback(async () => {
+    try {
+      await settingsApi.checkUpdates();
+    } catch (error) {
+      console.error(
+        "[AboutSection] Failed to open update download page",
+        error,
+      );
+      toast.error(t("settings.openUpdateDownloadFailed"), {
+        closeButton: true,
+      });
+    }
+  }, [t]);
+
   const handleCheckUpdate = useCallback(async () => {
     if (hasUpdate) {
       if (isPortable) {
-        try {
-          await settingsApi.checkUpdates();
-        } catch (error) {
-          console.error("[AboutSection] Portable update failed", error);
-        }
+        await handleOpenDownloadPage();
         return;
       }
 
@@ -155,14 +165,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
           description: extractErrorMessage(error) || undefined,
           closeButton: true,
         });
-        try {
-          await settingsApi.checkUpdates();
-        } catch (fallbackError) {
-          console.error(
-            "[AboutSection] Failed to open fallback updater",
-            fallbackError,
-          );
-        }
+        await handleOpenDownloadPage();
       } finally {
         setIsDownloading(false);
       }
@@ -181,7 +184,14 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
         closeButton: true,
       });
     }
-  }, [checkUpdate, hasUpdate, isPortable, resetDismiss, t]);
+  }, [
+    checkUpdate,
+    handleOpenDownloadPage,
+    hasUpdate,
+    isPortable,
+    resetDismiss,
+    t,
+  ]);
 
   const displayVersion = version ?? t("common.unknown");
 
@@ -222,10 +232,17 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
             </>
           ) : hasUpdate ? (
             <>
-              <Download className="h-3.5 w-3.5" />
-              {t("settings.updateTo", {
-                version: updateInfo?.availableVersion ?? "",
-              })}
+              {isPortable ? (
+                <ExternalLink className="h-3.5 w-3.5" />
+              ) : (
+                <Download className="h-3.5 w-3.5" />
+              )}
+              {t(
+                isPortable
+                  ? "settings.downloadUpdateOnGithub"
+                  : "settings.updateTo",
+                { version: updateInfo?.availableVersion ?? "" },
+              )}
             </>
           ) : isChecking ? (
             <>
@@ -297,8 +314,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
         )}
       </div>
 
-      {/* 下载与更新都走 ccswitch.io，用户不再经过仓库页，邀 Star 单独占一行；按钮即 GitHub 入口。
-          关掉后链接行补回 GitHub 按钮 */}
+      {/* 邀 Star 单独占一行；关掉后链接行补回 GitHub 按钮。 */}
       {!starPromptDismissed && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-3 bg-action-soft py-3.5 ps-5 pe-3">
           <div className="flex min-w-0 flex-1 items-center gap-3">

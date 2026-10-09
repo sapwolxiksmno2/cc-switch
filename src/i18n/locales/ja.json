@@ -887,6 +887,8 @@
     "browsePlaceholderPi": "例: /home/<your-username>/.pi/agent",
     "browseDirectory": "ディレクトリを選択",
     "resetDefault": "デフォルトに戻す（保存後に反映）",
+    "downloadUpdateOnGithub": "GitHub で v{{version}} をダウンロード",
+    "openUpdateDownloadFailed": "更新のダウンロードページを開けませんでした。時間をおいて再試行してください。",
     "checkForUpdates": "アップデートを確認",
     "updateTo": "v{{version}} に更新",
     "updating": "更新中...",

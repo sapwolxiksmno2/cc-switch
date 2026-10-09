@@ -30,6 +30,8 @@ mod openclaw_config;
 mod opencode_config;
 mod panic_hook;
 mod pi_config;
+mod portable;
+mod portable_window_state;
 mod prompt;
 mod prompt_files;
 mod provider;
@@ -96,6 +98,112 @@ fn set_windows_app_user_model_id(app: &tauri::AppHandle) {
         log::warn!("设置 Windows AppUserModelID 失败: 0x{result:08X}");
     } else {
         log::debug!("Windows AppUserModelID 已设置为 {app_id}");
+    }
+}
+
+/// 为 Portable 实例生成不包含根目录文本的稳定标识，避免与安装版 single-instance 冲突。
+#[cfg(any(target_os = "windows", test))]
+fn portable_instance_identifier(base: &str, root: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let normalized = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    let suffix = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{base}.portable.{suffix}")
+}
+
+/// 计算 Portable WebView2 profile 的绝对目标目录。
+#[cfg(any(target_os = "windows", test))]
+fn portable_webview_data_directory(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("data").join("webview2")
+}
+
+/// 创建主窗口；Windows Portable 使用解压目录内的 WebView2 profile。
+/// 自动创建已存在的窗口时直接复用，避免重复构建。
+#[allow(dead_code)]
+pub(crate) fn create_main_window(app: &tauri::AppHandle) -> Result<(), String> {
+    if app.get_webview_window("main").is_some() {
+        return Ok(());
+    }
+
+    let window_config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .ok_or_else(|| "主窗口配置未找到".to_string())?;
+
+    let builder = tauri::WebviewWindowBuilder::from_config(app, window_config)
+        .map_err(|error| format!("加载主窗口配置失败：{error}"))?;
+
+    #[cfg(target_os = "windows")]
+    let builder = if let Some(root) = portable::root_dir() {
+        let webview_data_dir = portable_webview_data_directory(&root);
+        // 覆盖用户预置值，确保 Portable profile 不会落到用户目录。
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview_data_dir);
+        builder.data_directory(webview_data_dir)
+    } else {
+        builder
+    };
+
+    builder
+        .build()
+        .map(|_| ())
+        .map_err(|error| format!("创建主窗口失败：{error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn show_portable_startup_error(message: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let text: Vec<u16> = std::ffi::OsStr::new(message)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let caption: Vec<u16> = std::ffi::OsStr::new("CC Switch 启动失败")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn configure_portable_context(context: &mut tauri::Context<tauri::Wry>) {
+    if !portable::is_portable() {
+        return;
+    }
+
+    let root = portable::root_dir().expect("Portable 根目录在初始化后必须可用");
+    context.config_mut().identifier = portable_instance_identifier(
+        &context.config().identifier,
+        &root,
+    );
+    if let Some(window) = context
+        .config_mut()
+        .app
+        .windows
+        .iter_mut()
+        .find(|window| window.label == "main")
+    {
+        window.create = false;
     }
 }
 
@@ -349,6 +457,14 @@ async fn update_tray_menu(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 必须早于 panic hook、插件及 Tauri 上下文，失败时禁止继续使用用户目录。
+    if let Err(error) = portable::initialize() {
+        eprintln!("Portable 初始化失败：{error}");
+        #[cfg(target_os = "windows")]
+        show_portable_startup_error(&format!("Portable 初始化失败：{error}"));
+        std::process::exit(1);
+    }
+
     // 设置 panic hook，在应用崩溃时记录日志到 <app_config_dir>/crash.log（默认 ~/.cc-switch/crash.log）
     panic_hook::setup_panic_hook();
 
@@ -423,6 +539,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         // 拦截窗口关闭：根据设置决定是否最小化到托盘
         .on_window_event(|window, event| {
+            portable_window_state::on_window_event(window, event);
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 log::info!("收到窗口关闭请求: label={}", window.label());
                 // 数据库版本过新的恢复模式下没有托盘可唤回，关闭即退出，避免应用隐身后台
@@ -459,13 +576,29 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_store::Builder::new().build())
-        .plugin(
+        .plugin(tauri_plugin_store::Builder::new().build());
+
+    // Portable 使用 data 内的窗口状态文件，避免插件访问默认 app_config_dir。
+    let builder = if portable::is_portable() {
+        builder
+    } else {
+        builder.plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(window_state_flags())
                 .build(),
         )
-        .setup(|app| {
+    };
+
+    let builder = builder.setup(|app| {
+            #[cfg(target_os = "windows")]
+            if portable::is_portable() {
+                create_main_window(app.handle()).map_err(|error| {
+                    show_portable_startup_error(&error);
+                    error
+                })?;
+                portable_window_state::restore(app.handle());
+            }
+
             let _ = rustls::crypto::ring::default_provider().install_default();
 
             // 预先刷新 Store 覆盖配置，确保后续路径读取正确（日志/数据库等）
@@ -520,9 +653,9 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             set_windows_app_user_model_id(app.handle());
 
-            // 注册 Updater 插件（桌面端）；放在 logger 之后，确保失败可诊断。
+            // Portable 仅检查元数据，不注册含安装入口的 Updater 插件。
             #[cfg(desktop)]
-            {
+            if !portable::is_portable() {
                 if let Err(e) = app
                     .handle()
                     .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1067,10 +1200,13 @@ pub fn run() {
 
                 #[cfg(all(debug_assertions, windows))]
                 {
-                    if let Err(e) = app.deep_link().register_all() {
-                        log::error!("✗ Failed to register deep link schemes: {}", e);
-                    } else {
-                        log::info!("✓ Deep link schemes registered (Windows debug)");
+                    // Portable 调试运行也不能写入注册表或覆盖安装版的协议关联。
+                    if !portable::is_portable() {
+                        if let Err(e) = app.deep_link().register_all() {
+                            log::error!("✗ Failed to register deep link schemes: {}", e);
+                        } else {
+                            log::info!("✓ Deep link schemes registered (Windows debug)");
+                        }
                     }
                 }
             }
@@ -1764,9 +1900,22 @@ pub fn run() {
             commands::is_lightweight_mode,
         ]);
 
-    let app = builder
-        .build(tauri::generate_context!())
-        .expect("error while running tauri application");
+    let context = tauri::generate_context!();
+    #[cfg(target_os = "windows")]
+    let context = {
+        let mut context = context;
+        configure_portable_context(&mut context);
+        context
+    };
+    let app = builder.build(context);
+    #[cfg(target_os = "windows")]
+    if portable::is_portable() {
+        if let Err(error) = &app {
+            show_portable_startup_error(&format!("创建应用失败：{error}"));
+            std::process::exit(1);
+        }
+    }
+    let app = app.expect("error while running tauri application");
 
     app.run(|app_handle, event| {
         // 处理退出请求（所有平台）
@@ -1833,6 +1982,9 @@ pub fn run() {
         // RunEvent::Exit，回调一返回进程就结束，只能在这里同步补做退出清理。重启也会走到
         // 这里，照上面 DeferToTauriRestart 的约定交还 Tauri 默认流程，不清理。
         if matches!(event, RunEvent::Exit) {
+            if portable::is_portable() {
+                save_window_state_before_exit(app_handle);
+            }
             if !RESTART_REQUESTED.load(Ordering::SeqCst) {
                 cleanup_before_system_exit(app_handle);
             }
@@ -2252,6 +2404,12 @@ fn window_state_flags() -> StateFlags {
 /// 当前应用的退出路径会拦截 `ExitRequested` 并最终直接 `std::process::exit(0)`，
 /// 这里需要在真正结束进程前手动落盘，避免 window-state 插件的默认退出钩子被绕过。
 pub fn save_window_state_before_exit(app_handle: &tauri::AppHandle) {
+    if portable::is_portable() {
+        if let Err(err) = portable_window_state::save() {
+            log::error!("保存 Portable 窗口状态失败：{err}");
+        }
+        return;
+    }
     if let Err(err) = app_handle.save_window_state(window_state_flags()) {
         log::error!("退出前保存窗口状态失败: {err}");
     } else {
@@ -2326,6 +2484,36 @@ mod tests {
         classify_exit_request, error_for_log, redact_url_for_log, redact_url_for_log_with_secrets,
         redact_url_origin_for_log, runtime_log_level_allows, ExitRequestAction,
     };
+
+    #[test]
+    fn portable_identifier_is_stable_distinct_and_does_not_expose_root() {
+        let first_root = std::path::Path::new(r"C:\\Apps\\CC Switch A");
+        let second_root = std::path::Path::new(r"C:\\Apps\\CC Switch B");
+        let first = super::portable_instance_identifier("com.ccswitch.desktop", first_root);
+
+        assert_eq!(
+            first,
+            super::portable_instance_identifier("com.ccswitch.desktop", first_root)
+        );
+        assert_ne!(
+            first,
+            super::portable_instance_identifier("com.ccswitch.desktop", second_root)
+        );
+        assert!(first.starts_with("com.ccswitch.desktop.portable."));
+        assert!(first
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-')));
+        assert!(!first.contains("CC Switch A"));
+    }
+
+    #[test]
+    fn portable_webview_data_directory_is_data_webview2() {
+        let root = std::path::Path::new(r"C:\\Apps\\CC Switch");
+        assert_eq!(
+            super::portable_webview_data_directory(root),
+            root.join("data").join("webview2")
+        );
+    }
 
     #[test]
     fn log_error_drops_toml_source_lines_but_keeps_position() {

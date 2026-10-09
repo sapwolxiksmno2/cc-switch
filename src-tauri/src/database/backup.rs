@@ -12,7 +12,7 @@ use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
-use tempfile::{Builder, NamedTempFile};
+use tempfile::Builder;
 
 const CC_SWITCH_SQL_EXPORT_HEADER: &str = "-- CC Switch SQLite 导出";
 
@@ -128,6 +128,9 @@ impl Database {
 
     /// 导出为 SQLite 兼容的 SQL 文本
     pub fn export_sql(&self, target_path: &Path) -> Result<(), AppError> {
+        let checked = crate::portable::checked_export_path(target_path)
+            .map_err(AppError::InvalidInput)?;
+        let target_path = checked.as_path();
         let dump = self.export_sql_string()?;
 
         if let Some(parent) = target_path.parent() {
@@ -183,7 +186,7 @@ impl Database {
         Self::validate_cc_switch_sql_export(sql_content)?;
 
         // 在临时数据库执行导入，确保失败不会污染主库
-        let temp_file = NamedTempFile::new().map_err(|e| AppError::IoContext {
+        let temp_file = crate::portable::create_temp_file().map_err(|e| AppError::IoContext {
             context: "创建临时数据库文件失败".to_string(),
             source: e,
         })?;
@@ -1043,7 +1046,7 @@ impl Database {
         // Stage and fully validate the selected file before touching the live
         // connection. A corrupt/future-schema backup or failed migration must
         // leave the current database unchanged.
-        let temp_file = NamedTempFile::new().map_err(|e| AppError::IoContext {
+        let temp_file = crate::portable::create_temp_file().map_err(|e| AppError::IoContext {
             context: "创建数据库恢复暂存文件失败".to_string(),
             source: e,
         })?;
@@ -1248,6 +1251,46 @@ mod tests {
         fn drop(&mut self) {
             let _ = update_settings(self.previous.clone());
         }
+    }
+
+    #[test]
+    #[serial]
+    fn portable_sql_import_and_recovery_stage_in_data_tmp() -> Result<(), AppError> {
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        let db = Database::memory()?;
+        let sql = db.export_sql_string()?;
+        db.import_sql_string_inner_with_hook(&sql, &[], || {
+            let files: Vec<_> = std::fs::read_dir(portable.temp_dir()).unwrap().collect();
+            assert!(!files.is_empty(), "SQL 导入必须在 data/tmp 创建真实暂存数据库");
+            Ok(())
+        })?;
+        assert_eq!(std::fs::read_dir(portable.temp_dir()).unwrap().count(), 0);
+        // 创建隔离的完整备份；恢复 hook 在暂存连接还存活时检查真实落点。
+        let backups = portable.data_dir().join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let source = Connection::open(backups.join("placeholder.db"))?;
+        source.execute_batch(&sql)?;
+        drop(source);
+        db.restore_from_backup_with_hook("placeholder.db", |_| {
+            assert!(std::fs::read_dir(portable.temp_dir()).unwrap().count() > 0);
+            Ok(())
+        })?;
+        assert_eq!(std::fs::read_dir(portable.temp_dir()).unwrap().count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn portable_sql_export_rejects_external_target_before_writing() -> Result<(), AppError> {
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        let outside = tempfile::tempdir().unwrap();
+        let db = Database::memory()?;
+        let target = outside.path().join("placeholder.sql");
+        assert!(db.export_sql(&target).is_err());
+        assert!(!target.exists());
+        let accepted = portable.data_dir().join("exports/placeholder.sql");
+        db.export_sql(&accepted)?;
+        assert!(accepted.is_file());
+        Ok(())
     }
 
     #[test]

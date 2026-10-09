@@ -93,6 +93,12 @@ export function DatabaseUpgrade({ payload }: DatabaseUpgradeProps) {
     setProgress(null);
     setErrorMsg(null);
     try {
+      // Portable 只打开发布页，升级安装交由用户更换解压目录中的应用文件。
+      if (await invoke<boolean>("is_portable_mode")) {
+        await invoke("open_external", { url: RELEASES_URL });
+        setPhase("upgradable");
+        return;
+      }
       unlistenRef.current?.();
       unlistenRef.current = await listen<DownloadProgress>(
         "update-download-progress",

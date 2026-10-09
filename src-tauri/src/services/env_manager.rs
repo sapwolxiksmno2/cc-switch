@@ -19,6 +19,7 @@ pub struct BackupInfo {
 
 /// Delete environment variables with automatic backup
 pub fn delete_env_vars(conflicts: Vec<EnvConflict>) -> Result<BackupInfo, String> {
+    crate::portable::reject_system_write("清理系统环境变量")?;
     // Step 1: Create backup
     let backup_info = create_backup(&conflicts)?;
 
@@ -67,6 +68,9 @@ fn create_backup(conflicts: &[EnvConflict]) -> Result<BackupInfo, String> {
 
 /// Get backup directory path
 pub(crate) fn backup_dir() -> Result<PathBuf, String> {
+    if let Some(data) = crate::portable::data_dir() {
+        return Ok(data.join("backups"));
+    }
     let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
     Ok(home.join(".cc-switch").join("backups"))
 }
@@ -151,6 +155,7 @@ fn delete_single_env(conflict: &EnvConflict) -> Result<(), String> {
 
 /// Restore environment variables from backup
 pub fn restore_from_backup(backup_path: String) -> Result<(), String> {
+    crate::portable::reject_system_write("恢复系统环境变量")?;
     // Read backup file
     let content = fs::read_to_string(&backup_path).map_err(|e| format!("读取备份文件失败: {e}"))?;
 
@@ -231,6 +236,17 @@ fn restore_single_env(conflict: &EnvConflict) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_env_backup_stays_in_data_and_system_writes_are_rejected() {
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        assert_eq!(backup_dir().unwrap(), portable.data_dir().join("backups"));
+        assert!(delete_env_vars(Vec::new()).unwrap_err().contains("Portable"));
+        // 输入不存在也必须先拒绝，不能尝试读取外部备份。
+        assert!(restore_from_backup("placeholder-backup.json".to_string())
+            .unwrap_err().contains("Portable"));
+        assert!(!portable.data_dir().join("backups").exists());
+    }
 
     #[test]
     fn test_backup_dir_creation() {

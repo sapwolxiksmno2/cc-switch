@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use serde::Serialize;
 
 use crate::codex_history_migration;
-use crate::config::{get_app_config_dir, get_home_dir};
+use crate::config::get_app_config_dir;
 use crate::database::Database;
 use crate::error::AppError;
 use crate::live::engine::DeviceStore;
@@ -50,8 +50,8 @@ struct Category {
 fn categories() -> Vec<Category> {
     let app_dir = get_app_config_dir();
     let app_backups = app_dir.join("backups");
-    // 写入引擎与旧版接管备份按设备目录落盘（不受 app_config_dir 覆盖影响）。
-    let device_backups = get_home_dir().join(".cc-switch").join("backups");
+    // 与写入引擎共用设备目录；Portable 固定 data，其他模式不受配置覆盖影响。
+    let device_backups = DeviceStore::for_device().file("backups");
     let env_backups =
         crate::services::env_manager::backup_dir().unwrap_or_else(|_| device_backups.clone());
 
@@ -280,6 +280,15 @@ pub fn location_dir(id: &str) -> Result<PathBuf, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_device_and_env_backup_categories_stay_in_data() {
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        for id in ["liveFirstWrite", "proxyLiveBackup", "envVars"] {
+            let category = categories().into_iter().find(|category| category.id == id).unwrap();
+            assert!(category.dir.starts_with(portable.data_dir()));
+        }
+    }
 
     #[test]
     fn whole_dir_measure_counts_top_level_entries_and_skips_ds_store() {

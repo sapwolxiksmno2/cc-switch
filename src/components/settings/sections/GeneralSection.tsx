@@ -31,12 +31,14 @@ const LANGUAGES: { value: Language; labelKey: string }[] = [
 
 interface GeneralSectionProps {
   settings: SettingsFormState;
+  isPortable?: boolean;
   onAutoSave: (updates: Partial<SettingsFormState>) => Promise<boolean>;
   onOpenApps: () => void;
 }
 
 export function GeneralSection({
   settings,
+  isPortable = false,
   onAutoSave,
   onOpenApps,
 }: GeneralSectionProps) {
@@ -148,12 +150,13 @@ export function GeneralSection({
         <SettingsCard>
           <SettingsSwitchRow
             label={t("settings.launchOnStartup")}
-            checked={!!settings.launchOnStartup}
-            onCheckedChange={(value) =>
-              void onAutoSave({ launchOnStartup: value })
-            }
+            checked={!isPortable && !!settings.launchOnStartup}
+            disabled={isPortable}
+            onCheckedChange={(value) => {
+              if (!isPortable) void onAutoSave({ launchOnStartup: value });
+            }}
           />
-          {settings.launchOnStartup && (
+          {!isPortable && settings.launchOnStartup && (
             <SettingsSwitchRow
               label={t("settings.silentStartup")}
               help={{

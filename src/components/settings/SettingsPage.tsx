@@ -217,8 +217,9 @@ export function SettingsPage({
   const SectionIcon = SECTION_ICON[section];
 
   const appConfigDirty =
+    !isPortable &&
     (appConfigDir?.trim() || undefined) !==
-    (initialAppConfigDir?.trim() || undefined);
+      (initialAppConfigDir?.trim() || undefined);
 
   const renderSection = () => {
     if (!settings) return null;
@@ -227,6 +228,7 @@ export function SettingsPage({
         return (
           <GeneralSection
             settings={settings}
+            isPortable={isPortable}
             onAutoSave={handleAutoSave}
             onOpenApps={onOpenApps}
           />
@@ -291,6 +293,7 @@ export function SettingsPage({
                   }}
                 >
                   <DirectoryInput
+                    disabled={isPortable}
                     label=""
                     value={appConfigDir}
                     resolvedValue={resolvedDirs.appConfig}

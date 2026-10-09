@@ -24,8 +24,8 @@ use super::patch::{LivePatch, LiveWriteError};
 
 /// 这台设备自己的状态目录：`live-state.json` 和首写备份都放在这里。
 ///
-/// 路径固定为 `get_home_dir()/.cc-switch`，和 `settings.json` 一样不跟随配置目录
-/// 覆盖：覆盖目录可能指向网盘同步目录，而写前意图和备份都是这台设备的事实。
+/// Portable 固定使用程序目录下的 `data`；其他模式仍使用 `get_home_dir()/.cc-switch`，
+/// 不跟随配置目录覆盖：写前意图和备份都是这台设备的事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceStore {
     root: PathBuf,
@@ -33,7 +33,9 @@ pub struct DeviceStore {
 
 impl DeviceStore {
     pub fn for_device() -> Self {
-        Self::at(crate::config::get_home_dir().join(".cc-switch"))
+        Self::at(crate::portable::data_dir().unwrap_or_else(|| {
+            crate::config::get_home_dir().join(".cc-switch")
+        }))
     }
 
     pub fn at(root: impl Into<PathBuf>) -> Self {
@@ -238,6 +240,18 @@ mod tests {
             set: vec![(KeyPath::new(&[key]), json!(value))],
             ..JsonPatch::default()
         }
+    }
+
+    #[test]
+    fn portable_device_store_uses_data_for_state_and_first_write_backup() {
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        let store = DeviceStore::for_device();
+        assert_eq!(store.state_path(), portable.data_dir().join("live-state.json"));
+        assert_eq!(store.file("proxy-live"), portable.data_dir().join("proxy-live"));
+        assert_eq!(
+            store.first_write_backup_dir(),
+            portable.data_dir().join("backups/live-first-write")
+        );
     }
 
     #[test]

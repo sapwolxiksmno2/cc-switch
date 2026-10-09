@@ -190,6 +190,10 @@ pub async fn restart_app(app: AppHandle) -> Result<bool, String> {
     Ok(true)
 }
 
+fn ensure_update_install_allowed() -> Result<(), String> {
+    crate::portable::reject_system_write("安装应用更新，请打开发布页下载新版 Portable")
+}
+
 /// 下载并安装应用更新，然后由后端直接重启应用。
 ///
 /// macOS 更新会原地替换 `.app` bundle。如果先返回前端、再让旧 WebView 调
@@ -197,6 +201,7 @@ pub async fn restart_app(app: AppHandle) -> Result<bool, String> {
 /// 这里把退出清理、安装和重启串在同一个后端流程中，避免依赖旧前端继续执行。
 #[tauri::command]
 pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> {
+    ensure_update_install_allowed()?;
     let updater = app
         .updater_builder()
         .build()
@@ -274,6 +279,9 @@ pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> 
 /// 升级无法解决，而不是让其反复尝试。
 #[tauri::command]
 pub async fn check_app_update_available(app: AppHandle) -> Result<Option<String>, String> {
+    if crate::portable::is_portable() {
+        return check_portable_update_metadata(&app).await;
+    }
     let updater = app
         .updater_builder()
         .build()
@@ -283,6 +291,117 @@ pub async fn check_app_update_available(app: AppHandle) -> Result<Option<String>
         .await
         .map_err(|e| format!("检查更新失败: {e}"))?;
     Ok(update.map(|u| u.version))
+}
+
+#[derive(serde::Deserialize)]
+struct PortableUpdateMetadata {
+    version: String,
+}
+
+fn valid_update_version(version: &str) -> bool {
+    let (core_and_pre, build) = match version.split_once('+') {
+        Some((core, build)) => (core, Some(build)),
+        None => (version, None),
+    };
+    let (core, prerelease) = match core_and_pre.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (core_and_pre, None),
+    };
+    let valid_number = |value: &str| {
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && (value.len() == 1 || !value.starts_with('0'))
+    };
+    let core_parts = core.split('.').collect::<Vec<_>>();
+    if core_parts.len() != 3 || !core_parts.iter().all(|part| valid_number(part)) {
+        return false;
+    }
+    let valid_identifiers = |value: &str, numeric_rule: bool| {
+        value.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!numeric_rule
+                    || !part.bytes().all(|byte| byte.is_ascii_digit())
+                    || valid_number(part))
+        })
+    };
+    // 既有 semver 比较器较宽松；这里只校验输入格式，版本排序仍复用同一实现。
+    prerelease.map_or(true, |value| valid_identifiers(value, true))
+        && build.map_or(true, |value| valid_identifiers(value, false))
+}
+
+fn portable_update_version_from_metadata(
+    metadata: &[u8],
+    current_version: &str,
+) -> Result<Option<String>, String> {
+    let metadata: PortableUpdateMetadata = serde_json::from_slice(metadata)
+        .map_err(|_| "Portable 更新元数据无效或缺少版本号".to_string())?;
+    if !valid_update_version(&metadata.version) {
+        return Err("Portable 更新元数据版本号无效".to_string());
+    }
+    let ordering = super::misc::compare_semver(&metadata.version, current_version)
+        .ok_or_else(|| "无法比较 Portable 更新版本号".to_string())?;
+    Ok((ordering == std::cmp::Ordering::Greater).then_some(metadata.version))
+}
+
+async fn check_portable_update_metadata(app: &AppHandle) -> Result<Option<String>, String> {
+    // Portable 未注册 updater 插件，仅独立请求公开元数据，不访问插件状态或安装包。
+    let endpoints = app
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|config| config.get("endpoints"))
+        .and_then(|endpoints| endpoints.as_array())
+        .ok_or_else(|| "未配置 Portable 更新元数据地址".to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| "创建 Portable 更新检查客户端失败".to_string())?;
+    let current_version = app.package_info().version.to_string();
+    let mut last_error = "未配置有效的 Portable 更新元数据地址".to_string();
+    for endpoint in endpoints {
+        let Some(endpoint) = endpoint.as_str() else {
+            continue;
+        };
+        let Ok(url) = reqwest::Url::parse(endpoint) else {
+            continue;
+        };
+        if !matches!(url.scheme(), "https" | "http") {
+            continue;
+        }
+        let result = async {
+            let mut response = client
+                .get(url)
+                .send()
+                .await
+                .map_err(|_| "请求 Portable 更新元数据失败".to_string())?;
+            if !response.status().is_success() {
+                return Err("Portable 更新元数据请求状态异常".to_string());
+            }
+            // 元数据设置上限，避免异常响应被当成安装包持续接收。
+            let mut metadata = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| "读取 Portable 更新元数据失败".to_string())?
+            {
+                if metadata.len() + chunk.len() > 1024 * 1024 {
+                    return Err("Portable 更新元数据过大".to_string());
+                }
+                metadata.extend_from_slice(&chunk);
+            }
+            portable_update_version_from_metadata(&metadata, &current_version)
+        }
+        .await;
+        match result {
+            Ok(version) => return Ok(version),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 /// 获取 app_config_dir 覆盖配置 (从 Store)
@@ -321,6 +440,53 @@ mod tests {
         CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
         WebDavSyncSettings,
     };
+
+    #[test]
+    fn portable_update_metadata_returns_only_newer_versions() {
+        for (version, current, expected) in [
+            ("4.0.5", "4.0.4", Some("4.0.5")),
+            ("4.0.4", "4.0.4", None),
+            ("4.0.3", "4.0.4", None),
+            ("4.0.4-beta.1", "4.0.4", None),
+            ("4.0.5-beta.1", "4.0.4", Some("4.0.5-beta.1")),
+            ("4.0.4", "4.0.4-beta.1", Some("4.0.4")),
+            ("4.0.5-beta.2", "4.0.5-beta.1", Some("4.0.5-beta.2")),
+            ("4.0.4+build.2", "4.0.4", None),
+        ] {
+            let metadata = serde_json::to_vec(&serde_json::json!({"version": version})).unwrap();
+            assert_eq!(
+                super::portable_update_version_from_metadata(&metadata, current).unwrap(),
+                expected.map(str::to_string)
+            );
+        }
+    }
+
+    #[test]
+    fn portable_update_metadata_rejects_invalid_or_missing_versions() {
+        for version in [
+            "invalid", "4.0", "04.0.5", "4.0.5-", "4.0.5-beta..1",
+            "4.0.5-beta.01", "4.0.5-非法", "4.0.5+", "4.0.5+build+other", " 4.0.5",
+        ] {
+            let metadata = serde_json::to_vec(&serde_json::json!({"version": version})).unwrap();
+            assert!(super::portable_update_version_from_metadata(&metadata, "4.0.4").is_err());
+        }
+        for metadata in [b"{}".as_slice(), b"{\"version\":null}", b"invalid JSON"] {
+            assert!(super::portable_update_version_from_metadata(metadata, "4.0.4").is_err());
+        }
+    }
+
+    #[test]
+    fn portable_update_install_guard_rejects_before_updater_creation() {
+        let _portable = crate::portable::test_support::PortableTestRoot::new();
+        assert!(super::ensure_update_install_allowed().unwrap_err().contains("Portable"));
+    }
+
+    #[tokio::test]
+    async fn portable_auto_launch_command_rejects_enable_and_ignores_disable() {
+        let _portable = crate::portable::test_support::PortableTestRoot::new();
+        assert!(super::set_auto_launch(true).await.unwrap_err().contains("Portable"));
+        assert!(super::set_auto_launch(false).await.unwrap());
+    }
 
     #[test]
     fn save_settings_should_preserve_existing_webdav_when_payload_omits_it() {

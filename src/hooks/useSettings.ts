@@ -233,6 +233,7 @@ export function useSettings(): UseSettingsResult {
 
         // 如果开机自启状态改变，调用系统 API
         if (
+          !isPortable &&
           payload.launchOnStartup !== undefined &&
           payload.launchOnStartup !== data?.launchOnStartup
         ) {
@@ -314,7 +315,15 @@ export function useSettings(): UseSettingsResult {
         throw error;
       }
     },
-    [data, queryClient, saveMutation, settings, syncClaudePluginIfChanged, t],
+    [
+      data,
+      isPortable,
+      queryClient,
+      saveMutation,
+      settings,
+      syncClaudePluginIfChanged,
+      t,
+    ],
   );
 
   // 完整保存设置（用于 Advanced 标签页的手动保存）
@@ -373,12 +382,16 @@ export function useSettings(): UseSettingsResult {
 
         await saveMutation.mutateAsync(payload);
 
-        await settingsApi.setAppConfigDirOverride(sanitizedAppDir ?? null);
-        // 基准值换成刚存的：设置页不卸载，下次比较和「需要重启」都只跟真正没保存的改动走
-        commitAppConfigDir(sanitizedAppDir);
+        // Portable 的数据目录固定，不将目录表单状态写入覆盖设置。
+        if (!isPortable) {
+          await settingsApi.setAppConfigDirOverride(sanitizedAppDir ?? null);
+          // 基准值换成刚存的：下次比较只跟真正没保存的改动走
+          commitAppConfigDir(sanitizedAppDir);
+        }
 
         // 只在开机自启状态真正改变时调用系统 API
         if (
+          !isPortable &&
           payload.launchOnStartup !== undefined &&
           payload.launchOnStartup !== data?.launchOnStartup
         ) {
@@ -473,7 +486,8 @@ export function useSettings(): UseSettingsResult {
           await invalidatePiDirectoryCaches(queryClient);
         }
 
-        const appDirChanged = sanitizedAppDir !== (previousAppDir ?? undefined);
+        const appDirChanged =
+          !isPortable && sanitizedAppDir !== (previousAppDir ?? undefined);
         setRequiresRestart(appDirChanged);
 
         if (!options?.silent) {
@@ -502,6 +516,7 @@ export function useSettings(): UseSettingsResult {
       commitAppConfigDir,
       data,
       initialAppConfigDir,
+      isPortable,
       queryClient,
       saveMutation,
       settings,

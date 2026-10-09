@@ -84,12 +84,7 @@ pub async fn check_for_updates(handle: AppHandle) -> Result<bool, String> {
 /// 判断是否为便携版（绿色版）运行
 #[tauri::command]
 pub async fn is_portable_mode() -> Result<bool, String> {
-    let exe_path = std::env::current_exe().map_err(|e| format!("获取可执行路径失败: {e}"))?;
-    if let Some(dir) = exe_path.parent() {
-        Ok(dir.join("portable.ini").is_file())
-    } else {
-        Ok(false)
-    }
+    Ok(crate::portable::is_portable())
 }
 
 /// 获取应用启动阶段的初始化错误（若有）。
@@ -253,6 +248,7 @@ pub async fn run_tool_lifecycle_action(
     action: String,
     wsl_shell_by_tool: Option<HashMap<String, WslShellPreferenceInput>>,
 ) -> Result<(), String> {
+    crate::portable::reject_system_write("安装或升级全局工具")?;
     let action = ToolLifecycleAction::from_str(&action)?;
     let requested = normalize_requested_tools(&tools);
     if requested.is_empty() {
@@ -296,6 +292,19 @@ fn run_tool_lifecycle_silently(command_line: &str, _label: &str) -> Result<(), S
     finish_lifecycle_output(&output)
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn prepare_tool_lifecycle_script(
+    command_line: &str,
+    label: &str,
+) -> Result<(tempfile::TempDir, PathBuf), String> {
+    // 每次调用使用独立目录，避免并发覆盖或删除另一工具的脚本。
+    let dir = crate::portable::create_temp_dir(Some("cc_switch_lifecycle_"))
+        .map_err(|e| format!("创建批处理目录失败: {e}"))?;
+    let path = dir.path().join(format!("{label}.bat"));
+    std::fs::write(&path, command_line).map_err(|e| format!("写入批处理文件失败: {e}"))?;
+    Ok((dir, path))
+}
+
 /// Windows 静默执行：command_line 是 .bat 内容（@echo off + call/wsl 行，CRLF 分隔），
 /// 写临时 .bat 后用 `cmd /C` 执行，`CREATE_NO_WINDOW` 抑制 console 窗口。
 #[cfg(target_os = "windows")]
@@ -303,14 +312,7 @@ fn run_tool_lifecycle_silently(command_line: &str, label: &str) -> Result<(), St
     use std::os::windows::process::CommandExt;
     use std::process::Command;
 
-    // 每次调用使用独立目录，避免同进程并发升级时覆盖或删除另一工具的脚本。
-    let script_dir = tempfile::Builder::new()
-        .prefix("cc_switch_lifecycle_")
-        .tempdir()
-        .map_err(|e| format!("创建批处理目录失败: {e}"))?;
-    let bat_file = script_dir.path().join(format!("{label}.bat"));
-    std::fs::write(&bat_file, command_line).map_err(|e| format!("写入批处理文件失败: {e}"))?;
-
+    let (_script_dir, bat_file) = prepare_tool_lifecycle_script(command_line, label)?;
     let output = Command::new("cmd")
         .arg("/C")
         .arg(&bat_file)
@@ -1150,7 +1152,7 @@ fn parse_semver(v: &str) -> Option<([u64; 3], Vec<String>)> {
 /// 比较两个版本号(遵循 semver:主版本三段优先;core 相等时有预发布 < 无预发布;
 /// 预发布段逐段比 —— 数字段按数值、数字段 < 非数字段、非数字段按 ASCII、前缀相同
 /// 则段更多者更大)。任一无法解析返回 None,调用方据此保守处理。
-fn compare_semver(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+pub(super) fn compare_semver(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     let (ac, ap) = parse_semver(a)?;
     let (bc, bp) = parse_semver(b)?;
@@ -4460,6 +4462,24 @@ fn resolve_launch_cwd(cwd: Option<String>) -> Result<Option<PathBuf>, String> {
     Ok(Some(resolved))
 }
 
+fn prepare_provider_terminal_config(
+    env_vars: &[(String, String)],
+    provider_id: &str,
+) -> Result<PathBuf, String> {
+    let config_file = crate::portable::terminal_temp_path(
+        &format!("claude_{}_{}.json", provider_id, std::process::id()),
+        ".json",
+    )
+    .map_err(|e| format!("创建终端配置文件失败: {e}"))?;
+    if let Err(error) = write_claude_config(&config_file, env_vars) {
+        if crate::portable::is_portable() {
+            let _ = std::fs::remove_file(&config_file);
+        }
+        return Err(error);
+    }
+    Ok(config_file)
+}
+
 /// 创建临时配置文件并启动 claude 终端
 /// 使用 --settings 参数传入提供商特定的 API 配置
 fn launch_terminal_with_env(
@@ -4467,15 +4487,7 @@ fn launch_terminal_with_env(
     provider_id: &str,
     cwd: Option<&Path>,
 ) -> Result<(), String> {
-    let temp_dir = std::env::temp_dir();
-    let config_file = temp_dir.join(format!(
-        "claude_{}_{}.json",
-        provider_id,
-        std::process::id()
-    ));
-
-    // 创建并写入配置文件
-    write_claude_config(&config_file, &env_vars)?;
+    let config_file = prepare_provider_terminal_config(&env_vars, provider_id)?;
 
     #[cfg(target_os = "macos")]
     {
@@ -4491,8 +4503,11 @@ fn launch_terminal_with_env(
 
     #[cfg(target_os = "windows")]
     {
-        launch_windows_terminal(&temp_dir, &config_file, cwd)?;
-        Ok(())
+        let result = launch_windows_terminal(&config_file, cwd);
+        if result.is_err() && crate::portable::is_portable() {
+            let _ = std::fs::remove_file(&config_file);
+        }
+        result
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -4531,7 +4546,8 @@ fn launch_macos_terminal(config_file: &std::path::Path, cwd: Option<&Path>) -> R
     let exec_line = build_exec_line(&shell, cwd);
     let final_cd_command = build_final_shell_cd_command(&shell, cwd);
 
-    let temp_dir = std::env::temp_dir();
+    let temp_dir = crate::portable::writable_temp_dir()
+        .map_err(|e| format!("创建终端临时目录失败: {e}"))?;
     let script_file = temp_dir.join(format!("cc_switch_launcher_{}.sh", std::process::id()));
     let config_path = config_file.to_string_lossy();
     let provider_command = build_provider_command_line(&shell, &config_path, cwd);
@@ -4936,7 +4952,8 @@ fn launch_linux_terminal(config_file: &std::path::Path, cwd: Option<&Path>) -> R
     ];
 
     // Create temp script file
-    let temp_dir = std::env::temp_dir();
+    let temp_dir = crate::portable::writable_temp_dir()
+        .map_err(|e| format!("创建终端临时目录失败: {e}"))?;
     let script_file = temp_dir.join(format!("cc_switch_launcher_{}.sh", std::process::id()));
     let config_path = config_file.to_string_lossy();
     let provider_command = build_provider_command_line(&shell, &config_path, cwd);
@@ -5028,17 +5045,32 @@ fn which_command(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn prepare_terminal_batch(default_name: &str, content: &str) -> Result<PathBuf, String> {
+    let path = crate::portable::terminal_temp_path(default_name, ".bat")
+        .map_err(|e| format!("创建终端批处理文件失败: {e}"))?;
+    // 先执行独立的 ASCII 行切换代码页，再解析包含中文路径的 UTF-8 内容。
+    let portable_content = crate::portable::is_portable()
+        .then(|| format!("@echo off\r\nchcp 65001 >nul\r\n{content}"));
+    let content = portable_content.as_deref().unwrap_or(content);
+    if let Err(error) = std::fs::write(&path, content) {
+        if crate::portable::is_portable() {
+            let _ = std::fs::remove_file(&path);
+        }
+        return Err(format!("写入批处理文件失败: {error}"));
+    }
+    Ok(path)
+}
+
 /// Windows: 根据用户首选终端启动
 #[cfg(target_os = "windows")]
 fn launch_windows_terminal(
-    temp_dir: &std::path::Path,
     config_file: &std::path::Path,
     cwd: Option<&Path>,
 ) -> Result<(), String> {
     let preferred = crate::settings::get_preferred_terminal();
     let terminal = preferred.as_deref().unwrap_or("cmd");
 
-    let bat_file = temp_dir.join(format!("cc_switch_claude_{}.bat", std::process::id()));
     let config_path_for_batch = escape_windows_batch_value(&config_file.to_string_lossy());
     let cwd_command = build_windows_cwd_command(cwd);
 
@@ -5057,8 +5089,10 @@ del \"%~f0\" >nul 2>&1
         cwd_command = cwd_command,
     );
 
-    std::fs::write(&bat_file, &content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
-
+    let bat_file = prepare_terminal_batch(
+        &format!("cc_switch_claude_{}.bat", std::process::id()),
+        &content,
+    )?;
     let bat_path = bat_file.to_string_lossy();
     let ps_cmd = format!("& '{}'", bat_path);
 
@@ -5073,16 +5107,20 @@ del \"%~f0\" >nul 2>&1
     };
 
     // If preferred terminal fails and it's not the default, try cmd as fallback
-    if result.is_err() && terminal != "cmd" {
+    let final_result = if result.is_err() && terminal != "cmd" {
         log::warn!(
             "首选终端 {} 启动失败，回退到 cmd: {:?}",
             terminal,
             result.as_ref().err()
         );
-        return run_windows_start_command(&["cmd", "/K", &bat_path], "cmd");
+        run_windows_start_command(&["cmd", "/K", &bat_path], "cmd")
+    } else {
+        result
+    };
+    if final_result.is_err() && crate::portable::is_portable() {
+        let _ = std::fs::remove_file(&bat_file);
     }
-
-    result
+    final_result
 }
 
 #[cfg_attr(windows, allow(dead_code))]
@@ -5159,7 +5197,9 @@ fn run_windows_start_command(args: &[&str], terminal_name: &str) -> Result<(), S
 /// **Security**：`command_line` 会被原样拼进 shell/batch 脚本，调用方必须
 /// 保证它是可信字符串（当前只由后端硬编码调用）。
 pub(crate) fn launch_terminal_running(command_line: &str, label: &str) -> Result<(), String> {
-    let temp_dir = std::env::temp_dir();
+    #[cfg(not(target_os = "windows"))]
+    let temp_dir = crate::portable::writable_temp_dir()
+        .map_err(|e| format!("创建终端临时目录失败: {e}"))?;
     let pid = std::process::id();
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -5291,14 +5331,15 @@ read -r _
         let preferred = crate::settings::get_preferred_terminal();
         let terminal = preferred.as_deref().unwrap_or("cmd");
 
-        let bat_file = temp_dir.join(format!("cc_switch_{}_{}.bat", label, pid));
         let content = format!(
             "@echo off\r\necho [cc-switch] Starting: {label}\r\necho.\r\n{cmd}\r\necho.\r\necho [cc-switch] Command exited. Press any key to close.\r\npause >nul\r\ndel \"%~f0\" >nul 2>&1\r\n",
             label = label,
             cmd = command_line,
         );
-        std::fs::write(&bat_file, &content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
-
+        let bat_file = prepare_terminal_batch(
+            &format!("cc_switch_{}_{}.bat", label, pid),
+            &content,
+        )?;
         let bat_path = bat_file.to_string_lossy();
         let ps_cmd = format!("& '{}'", bat_path);
 
@@ -5356,6 +5397,111 @@ pub async fn set_window_theme(window: tauri::Window, theme: String) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_provider_config_and_terminal_batches_are_materialized_in_data_tmp() {
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        let config = prepare_provider_terminal_config(
+            &[("PLACEHOLDER_SETTING".to_string(), "placeholder".to_string())],
+            "../placeholder-provider",
+        )
+        .unwrap();
+        let content = format!(
+            "@echo off\r\ntype \"{}\" >nul\r\ndel \"%~f0\" >nul 2>&1\r\n",
+            escape_windows_batch_value(&config.to_string_lossy()),
+        );
+        let provider = prepare_terminal_batch("provider-placeholder.bat", &content).unwrap();
+        let running = prepare_terminal_batch("running-placeholder.bat", &content).unwrap();
+        for path in [&config, &provider, &running] {
+            assert_eq!(path.parent().unwrap(), portable.temp_dir());
+            assert!(path.is_file());
+        }
+        let expected = format!("@echo off\r\nchcp 65001 >nul\r\n{content}");
+        for path in [&provider, &running] {
+            assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
+        }
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(json["env"]["PLACEHOLDER_SETTING"], "placeholder");
+        drop(portable);
+        for path in [&config, &provider, &running] {
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn non_portable_terminal_batch_keeps_original_bytes() {
+        assert!(!crate::portable::is_portable());
+        let fixture = tempfile::tempdir().unwrap();
+        let expected_path = fixture.path().join("installed-placeholder.bat");
+        let content = "@echo off\r\necho 中文占位内容\nexit /b 0\r\n";
+        let script = prepare_terminal_batch(expected_path.to_str().unwrap(), content).unwrap();
+        assert_eq!(script, expected_path);
+        assert_eq!(std::fs::read(&script).unwrap(), content.as_bytes());
+        drop(fixture);
+        assert!(!script.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_terminal_batch_handles_chinese_paths_from_legacy_code_page() {
+        use std::os::windows::process::CommandExt;
+
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        let config = portable.temp_dir().join("中文占位配置.json");
+        let readback = portable.temp_dir().join("中文读取结果.json");
+        let copied = portable.temp_dir().join("中文复制结果.json");
+        let placeholder = b"{\"placeholder\":true}\r\n";
+        std::fs::write(&config, placeholder).unwrap();
+        let config_path = escape_windows_batch_value(&config.to_string_lossy());
+        let readback_path = escape_windows_batch_value(&readback.to_string_lossy());
+        let copied_path = escape_windows_batch_value(&copied.to_string_lossy());
+        let content = format!(
+            "@echo off\r\n\
+             type \"{config_path}\" >\"{readback_path}\" || exit /b 1\r\n\
+             copy /y \"{config_path}\" \"{copied_path}\" >nul || exit /b 1\r\n\
+             del \"{config_path}\" >nul 2>&1\r\n\
+             if exist \"{config_path}\" exit /b 1\r\n\
+             (del \"%~f0\" >nul 2>&1 & exit 0)\r\n",
+        );
+        let script = prepare_terminal_batch("utf8-placeholder.bat", &content).unwrap();
+        // 按 cmd 原生参数传递，避免 CRT 引号转义。
+        let output = std::process::Command::new("cmd")
+            .args(["/D", "/C"])
+            .raw_arg(format!("chcp 936 >nul && call \"{}\"", script.display()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "占位批处理执行失败：{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(std::fs::read(&readback).unwrap(), placeholder);
+        assert_eq!(std::fs::read(&copied).unwrap(), placeholder);
+        assert!(!config.exists());
+        assert!(!script.exists());
+        drop(portable);
+        assert!(!readback.exists());
+        assert!(!copied.exists());
+    }
+
+    #[test]
+    fn portable_lifecycle_script_is_materialized_in_data_tmp_and_cleaned() {
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        let (guard, script) = prepare_tool_lifecycle_script("@echo off\r\nexit /b 0\r\n", "placeholder").unwrap();
+        assert!(script.starts_with(portable.temp_dir()));
+        assert_eq!(std::fs::read(&script).unwrap(), b"@echo off\r\nexit /b 0\r\n");
+        drop(guard);
+        assert!(!script.exists());
+    }
+
+    #[tokio::test]
+    async fn portable_tool_lifecycle_rejects_before_tool_resolution() {
+        let _portable = crate::portable::test_support::PortableTestRoot::new();
+        let error = run_tool_lifecycle_action(
+            vec!["placeholder-tool".to_string()], "placeholder-action".to_string(), None,
+        ).await.unwrap_err();
+        assert!(error.contains("Portable"));
+    }
 
     #[test]
     fn external_url_whitelist() {

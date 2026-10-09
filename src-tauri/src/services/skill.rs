@@ -626,8 +626,13 @@ impl SkillService {
 
     // ========== 路径管理 ==========
 
-    /// 获取 SSOT 目录（根据设置返回 ~/.cc-switch/skills/ 或 ~/.agents/skills/）
+    /// Portable 固定使用 data/skills，其他模式继续遵循存储位置设置。
     pub fn get_ssot_dir() -> Result<PathBuf> {
+        if let Some(data) = crate::portable::data_dir() {
+            let dir = data.join("skills");
+            fs::create_dir_all(&dir)?;
+            return Ok(dir);
+        }
         let location = crate::settings::get_skill_storage_location();
         let dir = match location {
             SkillStorageLocation::CcSwitch => get_app_config_dir().join("skills"),
@@ -1816,6 +1821,10 @@ impl SkillService {
         db: &Arc<Database>,
         target: SkillStorageLocation,
     ) -> Result<MigrationResult> {
+        if target == SkillStorageLocation::Unified {
+            crate::portable::reject_system_write("将 Skill 存储迁移到 Unified 目录")
+                .map_err(anyhow::Error::msg)?;
+        }
         let _state_guard = skill_state_write_guard();
         let current = crate::settings::get_skill_storage_location();
         if current == target {
@@ -3532,7 +3541,7 @@ impl SkillService {
         // 守卫全程持有，成功后连同目录一起交给调用方（见 `extract_local_zip` 的说明）。
         // 原来这里立刻 keep()，任何一步失败——下载超时、ARCHIVE_TOO_LARGE、解压出错
         // ——都会把半个解压目录永久留在磁盘上，反复触发即可持续填盘。
-        let temp_dir = tempfile::tempdir()?;
+        let temp_dir = crate::portable::create_temp_dir(None)?;
         let temp_path = temp_dir.path().to_path_buf();
 
         // Exercise the real install/update flow without network access in unit tests.
@@ -4268,7 +4277,7 @@ impl SkillService {
     /// 磁盘上。守卫交给调用方持有，清理就变成作用域结束时自动发生，不再依赖每条
     /// 出口都记得手写 `remove_dir_all`（实测漏了不止一条）。
     fn extract_local_zip(zip_path: &Path) -> Result<tempfile::TempDir> {
-        Self::extract_local_zip_in(zip_path, &std::env::temp_dir())
+        Self::extract_local_zip_in(zip_path, &crate::portable::writable_temp_dir()?)
     }
 
     /// 与 [`Self::extract_local_zip`] 相同，但临时目录的落点由调用方指定。
@@ -4709,6 +4718,44 @@ pub fn migrate_skills_to_ssot(db: &Arc<Database>) -> Result<usize> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn portable_repo_download_and_local_zip_extract_stay_in_data_tmp() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        let source = tempdir().unwrap();
+        fs::write(source.path().join("SKILL.md"), b"# placeholder skill").unwrap();
+        let service = SkillService {
+            repo_fixture: Some(source.path().to_path_buf()),
+        };
+        let repo = SkillRepo {
+            owner: "placeholder-owner".to_string(),
+            name: "placeholder-repo".to_string(),
+            branch: "main".to_string(),
+            enabled: true,
+        };
+        let (download, _) = service.download_repo(&repo).await.unwrap();
+        assert_eq!(download.path().parent().unwrap(), portable.temp_dir());
+        assert!(download.path().join("SKILL.md").is_file());
+        let zip_path = source.path().join("placeholder.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
+        zip.start_file("skill/SKILL.md", SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"# placeholder skill").unwrap();
+        zip.finish().unwrap();
+        let extracted = SkillService::extract_local_zip(&zip_path).unwrap();
+        assert_eq!(extracted.path().parent().unwrap(), portable.temp_dir());
+        assert!(extracted.path().join("skill/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn portable_ssot_is_fixed_and_unified_migration_is_rejected() {
+        let portable = crate::portable::test_support::PortableTestRoot::new();
+        assert_eq!(SkillService::get_ssot_dir().unwrap(), portable.data_dir().join("skills"));
+        let db = Arc::new(Database::memory().unwrap());
+        assert!(SkillService::migrate_storage(&db, SkillStorageLocation::Unified)
+            .unwrap_err().to_string().contains("Portable"));
+    }
 
     #[test]
     fn skill_state_lock_allows_snapshots_but_excludes_writers() {

@@ -344,7 +344,7 @@ pub struct CodexOfficialHistoryUnifyMigration {
 
 /// 应用设置结构
 ///
-/// 存储设备级别设置，保存在本地 `~/.cc-switch/settings.json`，不随数据库同步。
+/// 存储设备级别设置，Portable 保存在 `data/settings.json`，其他模式保存在 `~/.cc-switch/settings.json`，不随数据库同步。
 /// 这确保了云同步场景下多设备可以独立运作。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -591,12 +591,14 @@ impl Default for AppSettings {
 
 impl AppSettings {
     fn settings_path() -> Option<PathBuf> {
-        // settings.json 保留用于旧版本迁移和无数据库场景
-        Some(
-            crate::config::get_home_dir()
-                .join(".cc-switch")
-                .join("settings.json"),
-        )
+        Some(Self::settings_path_for_data_dir(crate::portable::data_dir()))
+    }
+
+    fn settings_path_for_data_dir(portable_data_dir: Option<PathBuf>) -> PathBuf {
+        // Portable 只读取自身设置；其他模式保留设备设置的原有位置，不受 Store 覆盖影响。
+        portable_data_dir
+            .unwrap_or_else(|| crate::config::get_home_dir().join(".cc-switch"))
+            .join("settings.json")
     }
 
     fn normalize_paths(&mut self) {
@@ -1208,6 +1210,27 @@ pub fn update_s3_sync_status(status: WebDavSyncStatus) -> Result<(), AppError> {
 mod tests {
     use super::*;
     use crate::app_config::AppType;
+
+    #[test]
+    fn portable_settings_path_stays_in_data() {
+        let fixture = tempfile::tempdir().expect("创建测试目录");
+        let data = fixture.path().join("便携版 with spaces").join("data");
+
+        let path = AppSettings::settings_path_for_data_dir(Some(data.clone()));
+
+        assert!(path.is_absolute());
+        assert_eq!(path, data.join("settings.json"));
+    }
+
+    #[test]
+    fn non_portable_settings_path_keeps_device_settings_in_home() {
+        assert_eq!(
+            AppSettings::settings_path_for_data_dir(None),
+            crate::config::get_home_dir()
+                .join(".cc-switch")
+                .join("settings.json")
+        );
+    }
 
     #[test]
     fn visible_apps_old_settings_default_claude_desktop_visible() {

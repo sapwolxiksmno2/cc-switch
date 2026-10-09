@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 use tauri_plugin_store::StoreExt;
 
@@ -21,13 +21,43 @@ fn update_cached_override(value: Option<PathBuf>) {
     }
 }
 
-/// 获取缓存中的 app_config_dir 覆盖路径
+/// 获取 app_config_dir 覆盖路径，Portable 始终显示固定数据目录。
 pub fn get_app_config_dir_override() -> Option<PathBuf> {
+    if let Some(data_dir) = crate::portable::data_dir() {
+        return Some(data_dir);
+    }
     override_cache().read().ok()?.clone()
 }
 
+fn store_path() -> PathBuf {
+    store_path_for_data_dir(crate::portable::data_dir().as_deref())
+}
+
+fn store_path_for_data_dir(portable_data_dir: Option<&Path>) -> PathBuf {
+    match portable_data_dir {
+        Some(data_dir) => data_dir.join("app_paths.json"),
+        None => PathBuf::from("app_paths.json"),
+    }
+}
+
+fn validate_portable_override(data_dir: &Path, path: Option<&str>) -> Result<(), AppError> {
+    if let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) {
+        if Path::new(path) != data_dir {
+            return Err(AppError::Message(
+                "Portable 模式的数据目录固定为程序目录下的 data，不能修改".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn read_override_from_store(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let store = match app.store_builder("app_paths.json").build() {
+    // 不读取旧 Store 或 Portable Store 中的覆盖值，避免外部目录影响数据隔离。
+    if let Some(data_dir) = crate::portable::data_dir() {
+        return Some(data_dir);
+    }
+
+    let store = match app.store_builder(store_path()).build() {
         Ok(store) => store,
         Err(e) => {
             log::warn!("无法创建 Store: {e}");
@@ -75,8 +105,15 @@ pub fn set_app_config_dir_to_store(
     app: &tauri::AppHandle,
     path: Option<&str>,
 ) -> Result<(), AppError> {
+    if let Some(data_dir) = crate::portable::data_dir() {
+        // 设置页会回传查询到的固定目录；重置与保存当前值均为无写入的幂等操作。
+        validate_portable_override(&data_dir, path)?;
+        update_cached_override(Some(data_dir));
+        return Ok(());
+    }
+
     let store = app
-        .store_builder("app_paths.json")
+        .store_builder(store_path())
         .build()
         .map_err(|e| AppError::Message(format!("创建 Store 失败: {e}")))?;
 
@@ -132,4 +169,52 @@ pub fn migrate_app_config_dir_from_settings(app: &tauri::AppHandle) -> Result<()
 
     let _ = refresh_app_config_dir_override(app);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_store_path_is_absolute_and_stays_in_data() {
+        let fixture = tempfile::tempdir().expect("创建测试目录");
+        let data = fixture.path().join("便携版 with spaces").join("data");
+
+        let path = store_path_for_data_dir(Some(&data));
+
+        assert!(path.is_absolute());
+        assert_eq!(path, data.join("app_paths.json"));
+    }
+
+    #[test]
+    fn non_portable_store_path_uses_existing_tauri_resolver() {
+        let path = store_path_for_data_dir(None);
+
+        assert_eq!(path, PathBuf::from("app_paths.json"));
+        assert!(path.is_relative());
+    }
+
+    #[test]
+    fn portable_override_allows_current_directory_and_reset() {
+        let fixture = tempfile::tempdir().expect("创建测试目录");
+        let data = fixture.path().join("data");
+        let current = data.to_str().expect("测试路径为 UTF-8");
+        let padded = format!("  {current}  ");
+
+        for path in [None, Some(""), Some("  "), Some(current), Some(padded.as_str())] {
+            assert!(validate_portable_override(&data, path).is_ok());
+        }
+    }
+
+    #[test]
+    fn portable_override_rejects_other_directories() {
+        let fixture = tempfile::tempdir().expect("创建测试目录");
+        let data = fixture.path().join("data");
+        let other = fixture.path().join("other");
+
+        assert!(validate_portable_override(&data, other.to_str()).is_err());
+        assert!(validate_portable_override(&data, Some("data")).is_err());
+        assert!(validate_portable_override(&data, Some("~/.cc-switch")).is_err());
+        assert!(!other.exists());
+    }
 }

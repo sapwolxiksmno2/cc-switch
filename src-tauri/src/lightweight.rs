@@ -31,8 +31,6 @@ pub fn enter_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 pub fn exit_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
-    use tauri::WebviewWindowBuilder;
-
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
@@ -55,18 +53,44 @@ pub fn exit_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    let window_config = app
-        .config()
-        .app
-        .windows
-        .iter()
-        .find(|w| w.label == "main")
-        .ok_or("主窗口配置未找到")?;
+    #[cfg(target_os = "windows")]
+    if crate::portable::is_portable() {
+        crate::create_main_window(app)?;
+        crate::portable_window_state::restore(app);
+    } else {
+        use tauri::WebviewWindowBuilder;
 
-    WebviewWindowBuilder::from_config(app, window_config)
-        .map_err(|e| format!("加载主窗口配置失败: {e}"))?
-        .build()
-        .map_err(|e| format!("创建主窗口失败: {e}"))?;
+        let window_config = app
+            .config()
+            .app
+            .windows
+            .iter()
+            .find(|w| w.label == "main")
+            .ok_or("主窗口配置未找到")?;
+
+        WebviewWindowBuilder::from_config(app, window_config)
+            .map_err(|e| format!("加载主窗口配置失败: {e}"))?
+            .build()
+            .map_err(|e| format!("创建主窗口失败: {e}"))?;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        use tauri::WebviewWindowBuilder;
+
+        let window_config = app
+            .config()
+            .app
+            .windows
+            .iter()
+            .find(|w| w.label == "main")
+            .ok_or("主窗口配置未找到")?;
+
+        WebviewWindowBuilder::from_config(app, window_config)
+            .map_err(|e| format!("加载主窗口配置失败: {e}"))?
+            .build()
+            .map_err(|e| format!("创建主窗口失败: {e}"))?;
+    }
 
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
